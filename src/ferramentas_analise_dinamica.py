@@ -51,9 +51,18 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
     #      do leak e inspecionar variáveis com o GDB, gerando um log muito mais
     #      rico para a IA classificar.
     #
-    # Conclusão: a Malha 1 é especialista em erros de acesso (crashes imediatos),
-    # e a Malha 2 é especialista em vazamentos (erros silenciosos). Cada ferramenta
-    # faz o que faz melhor.
+    #     Conclusão: memory leaks são delegados ao Valgrind (Malha 2) por duas razões:
+    #
+    # (1) o Valgrind+Memcheck detecta vazamentos no heap com cobertura total,
+    #     incluindo leaks indiretos (ex: nós internos de lista encadeada) que o LSan
+    #     frequentemente classifica apenas como "still reachable" sem detalhar a cadeia;
+    #
+    # (2) o vgdb permite pausar o processo no momento exato do leak e inspecionar
+    #     variáveis com o GDB, gerando um log muito mais rico para a IA do que o
+    #     stack trace simples que o LSan produziria — mesmo que ele rodasse sem o GDB.
+    #
+    # O ponto fraco do Valgrind é a stack (erros de acesso imediatos como buffer
+    # overflow), que é exatamente o que o ASan+GDB cobre na Malha 1.
     env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0"
 
     # --- FASE 3: EXECUÇÃO VIA GDB (ANÁLISE POST-MORTEM) ---
