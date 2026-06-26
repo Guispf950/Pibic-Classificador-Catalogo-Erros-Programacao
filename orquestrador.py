@@ -62,17 +62,23 @@ def main():
                 log_bruto = resultado["log"]
 
         # ── ETAPA 3: Processamento do log e classificação por IA ─────────────────────
+        # ── ETAPA 3: Processamento do log e classificação por IA ─────────────────────
         if log_bruto:
             print(f"  -> Falha detectada ({ferramenta_usada}). Extraindo contexto...")
-
-            # Remove ruído do log bruto (endereços de memória, frames irrelevantes, etc.)
-            # e retém apenas o contexto útil para a IA classificar o erro
             log_limpo = limpar_log_gdb(log_bruto, nome_arquivo)
 
-            print(f"  -> Acionando IA Local para classificação forense...")
+            # Lê o código-fonte do aluno para enviar junto com o log à IA.
+            # Com o código em mãos, o modelo consegue correlacionar a linha do erro
+            # com a declaração real das variáveis, tipos e contexto ao redor —
+            # em vez de inferir apenas pelo backtrace do depurador.
+            # errors='replace' substitui bytes inválidos pelo caractere '?' em vez de quebrar.
+            # Necessário porque arquivos .c de alunos podem ter comentários com acentos
+            # salvos em encodings diferentes de UTF-8 (ex: latin-1, cp1252).
+            with open(caminho_codigo, 'r', encoding='utf-8', errors='replace') as f:
+                codigo_fonte = f.read()
 
-            # Envia o log limpo ao LLM local e recebe um dicionário com a análise do erro
-            analise_ia = classificar_erro(log_limpo)
+            print(f"  -> Acionando IA Local para classificação forense...")
+            analise_ia = classificar_erro(log_limpo, codigo_fonte)  # <-- passa o código
 
             # Constrói o registro deste arquivo para o CSV.
             # .get() com valor padrão garante que campos ausentes na resposta da IA não quebrem o pipeline.

@@ -6,8 +6,10 @@ import time
 def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
     """
     Malha 1: Compila com AddressSanitizer e executa via GDB para capturar
-    erros de memória (buffer overflow, use-after-free) e vazamentos (LeakSanitizer).
+    erros de acesso inválido (buffer overflow, use-after-free, stack overflow).
     Retorna um dict com 'erro' e 'log' se algo for detectado, ou None se limpo.
+    
+    NOTA: Memory leaks são intencionalmente delegados à Malha 2 (Valgrind+vgdb).
     """
 
     # --- FASE 1: COMPILAÇÃO COM ASAN ---
@@ -28,10 +30,31 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
     # --- FASE 2: CONFIGURAÇÃO DO AMBIENTE ---
     # Copia as variáveis de ambiente do processo atual para não perder PATH, HOME etc.
     env = os.environ.copy()
-    # abort_on_error=1: força o ASan a chamar abort() no primeiro erro detectado,
-    # em vez de tentar continuar. Isso garante que o GDB consiga capturar
-    # o estado exato da memória no momento da falha (sem corrupção adicional).
-    env["ASAN_OPTIONS"] = "abort_on_error=1"
+
+    # abort_on_error=1: força o ASan a chamar abort() no primeiro erro de acesso
+    # detectado, permitindo que o GDB congele o processo e capture o estado exato
+    # da memória (backtrace + variáveis locais) no momento da falha.
+    #
+    # detect_leaks=0: desabilita o LeakSanitizer (LSan) intencionalmente.
+    # Isso não é uma limitação — é uma decisão arquitetural do pipeline:
+    #
+    #   1. INCOMPATIBILIDADE TÉCNICA: O LSan usa ptrace para rastrear o heap.
+    #      O GDB também usa ptrace para depurar o processo. Dois usuários de ptrace
+    #      no mesmo processo causam conflito, então o LSan se autodesabilita
+    #      ao detectar que está sendo executado dentro de um debugger.
+    #      Mesmo que rodasse, o log seria poluído com alocações internas do GDB,
+    #      gerando falsos positivos.
+    #
+    #   2. QUALIDADE DO DIAGNÓSTICO: O LSan reporta apenas o stack trace do malloc,
+    #      sem acesso ao estado das variáveis no momento do leak. O Valgrind+vgdb
+    #      (Malha 2) resolve isso: o vgdb permite pausar o processo no ponto exato
+    #      do leak e inspecionar variáveis com o GDB, gerando um log muito mais
+    #      rico para a IA classificar.
+    #
+    # Conclusão: a Malha 1 é especialista em erros de acesso (crashes imediatos),
+    # e a Malha 2 é especialista em vazamentos (erros silenciosos). Cada ferramenta
+    # faz o que faz melhor.
+    env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0"
 
     # --- FASE 3: EXECUÇÃO VIA GDB (ANÁLISE POST-MORTEM) ---
     # O GDB executa o binário compilado com ASan. Se o ASan detectar um erro,
@@ -53,13 +76,13 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
     saida_completa = execucao.stdout + execucao.stderr
 
     # --- FASE 4: ANÁLISE DO RESULTADO ---
-    # Verifica se o ASan reportou erro de acesso inválido (ex: buffer overflow,
-    # use-after-free) OU se o LeakSanitizer reportou vazamento de memória.
-    # Ambos usam prefixos distintos no log, por isso checamos os dois.
-    if "ERROR: AddressSanitizer" in saida_completa or "ERROR: LeakSanitizer" in saida_completa:
+    # Verifica apenas erros de acesso inválido (Stack e Heap) — leaks são tratados pela Malha 2.
+    # "ERROR: AddressSanitizer" cobre: buffer overflow, use-after-free,
+    # stack-buffer-overflow, global-buffer-overflow, use-after-return, etc.
+    if "ERROR: AddressSanitizer" in saida_completa:
         return {"erro": "Detectado pelo ASan", "log": saida_completa}
 
-    # Nenhum erro encontrado: retorna None para indicar que o código passou nesta malha
+    # Nenhum erro de acesso encontrado: passa para a Malha 2 (Valgrind)
     return None
 
 

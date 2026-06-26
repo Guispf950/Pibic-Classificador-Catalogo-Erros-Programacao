@@ -9,27 +9,46 @@ URL_LLM_LOCAL = "http://192.168.0.105:11434/api/generate"
 NOME_MODELO = "qwen2.5-coder:7b"
 
 
-def classificar_erro(log_limpo):
+def classificar_erro(log_limpo, codigo_fonte=""):
     """
-    Envia o log de erro (já limpo/pré-processado) para o LLM local
+    Envia o log de erro e o código-fonte original para o LLM local
     e retorna um dicionário Python com a classificação forense do erro.
+    
+    O código-fonte é opcional (default "") para manter compatibilidade,
+    mas quando fornecido enriquece significativamente a análise da IA:
+    a IA consegue ver a declaração das variáveis, o tipo, o escopo e
+    o contexto ao redor da linha do erro — não apenas o backtrace.
     """
 
+    # Bloco de código-fonte incluído no prompt apenas se foi fornecido.
+    # Separado em variável para não poluir o f-string principal.
+    if codigo_fonte:
+        secao_codigo = f"""
+        Código-Fonte do Programa:
+        ```c
+        {codigo_fonte}
+        ```
+            """
+    else:
+        secao_codigo = ""
+
+
     prompt = f"""
-    Você é um classificador forense de erros em C. Analise o log abaixo e retorne APENAS um objeto JSON válido.
-    
+    Você é um classificador forense de erros em C. Analise o log e o código abaixo e retorne APENAS um objeto JSON válido.
+
     Log do Depurador:
     {log_limpo}
-    
+    Código-Fonte do Programa:
+    {secao_codigo}
     Formato OBRIGATÓRIO (não inclua formatação markdown ou texto fora do JSON):
     {{
-        "tipo_erro": "Nome técnico (ex: stack-buffer-overflow, uninitialized-value)",
-        "linha_ocorrencia": "Número da linha do código",
-        "variaveis_envolvidas": "Resumo rápido das variáveis envolvidas no erro, pode ser mais de uma e informar seus respectivos valores (exemplo: i=5, contador=0)",
+        "tipo_erro": "Nome técnico do erro (ex: stack-buffer-overflow, uninitialized-value, memory-leak)",
+        "linha_ocorrencia": "Número da linha onde o erro foi detectado pelo depurador",
+        "variaveis_envolvidas": "Variáveis citadas no log e seus valores (ex: i=5, contador=0). Para ponteiros, use nome* (ex: vetor*, cabeca*). Liste apenas o que aparece explicitamente no log.",
+        "causa_raiz": "O que realmente causou o erro (ex: 'ponteiro vetor* alocado em malloc() nunca foi liberado', 'estrutura No* com campo prox* também alocado mas não liberado', 'acesso ao índice 5 em array de tamanho 5')",
         "descricao_curta": "Explicação em 1 frase curta do problema"
     }}
     """
-
     try:
         resposta = requests.post(URL_LLM_LOCAL, json={
             "model": NOME_MODELO,
