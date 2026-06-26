@@ -88,6 +88,7 @@ def main():
                 "Tipo Erro":   analise_ia.get("tipo_erro", "Desconhecido"),
                 "Linha":       analise_ia.get("linha_ocorrencia", "-"),
                 "Variaveis":   analise_ia.get("variaveis_envolvidas", "-"),
+                "Causa Raiz":  analise_ia.get("causa_raiz", "-"),        # <-- novo
                 "Diagnostico": analise_ia.get("descricao_curta", "-")
             })
         else:

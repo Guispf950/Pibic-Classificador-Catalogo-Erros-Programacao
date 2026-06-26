@@ -1,5 +1,5 @@
-Arquivo,Ferramenta,Tipo Erro,Linha,Variaveis,Diagnostico
-teste_asan.c,ASan+GDB,stack-buffer-overflow,8,"i=5, notas={10, 20, 30, 40, 50}","O laço percorre até i=5, invadindo a memória da pilha."
-teste_bubbleSort_valgrind.c,Valgrind+vgdb,memory-leak,48,vetor* (ponteiro para o vetor alocado),O programa aloca dinamicamente um vetor de inteiros mas esquece de liberar a memória alocada ao final.
-teste_lista_encadeada_valgrind.c,Valgrind+vgdb,memory-leak,47,minha_lista*,"O programa aloca memória dinamicamente para um nó de lista encadeada, mas não libera essa memória antes de encerrar."
-teste_variavel_nao_inicializada.c,Valgrind+vgdb,uninitialized-value,7,contador = 0,O uso da variável 'contador' sem valor inicial resultou em um comportamento indeterminado.
+Arquivo,Ferramenta,Tipo Erro,Linha,Variaveis,Causa Raiz,Diagnostico
+teste_asan.c,ASan+GDB,stack-buffer-overflow,8,"i=5, notas={10, 20, 30, 40, 50}","O laço vai até i <= 5. Na última iteração (i=5), invade a memória!",Acesso ao índice 5 em array de tamanho 5
+teste_bubbleSort_valgrind.c,Valgrind+vgdb,memory-leak,32,{'vetor*': 'ponteiro para um vetor alocado dinamicamente'},"A função 'main' aloca memória para o ponteiro 'vetor', mas não libera essa memória com 'free' antes de encerrar, causando uma vazamento de memória.",Vazamento de memória ocorre ao alocar espaço dinamicamente e não liberar corretamente.
+teste_lista_encadeada_valgrind.c,Valgrind+vgdb,memory-leak,47,minha_lista*,"A função main() não libera a memória alocada para a lista encadeada, resultando em um vazamento de memória.","A lista encadeada não foi liberada após o uso, causando um vazamento de memória."
+teste_variavel_nao_inicializada.c,Valgrind+vgdb,uninitialized-value,7,contador=0,"A variável 'contador' foi declarada, mas não inicializada, resultando em um valor indeterminado.",Uso de uma variável que não foi inicializada.
