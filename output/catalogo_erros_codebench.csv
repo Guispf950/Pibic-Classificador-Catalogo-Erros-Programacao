@@ -1,0 +1,5 @@
+Arquivo,Ferramenta,Tipo Erro,Linha,Variaveis,Diagnostico
+teste_asan.c,ASan+GDB,stack-buffer-overflow,8,"i=5, notas={10, 20, 30, 40, 50}",A variável 'notas' está sendo acessada além de seu limite de tamanho na função preencher_notas.
+teste_bubbleSort_valgrind.c,Valgrind+vgdb,memory-leak,17,Nenhuma variável específica mencionada no log,"Detecção de uma perda de memória de 4,000 bytes em uma única bloco"
+teste_lista_encadeada_valgrind.c,Valgrind+vgdb,memory-leak,47,Nenhuma variável específica mencionada,A memória alocada dinamicamente foi perdida após o uso
+teste_variavel_nao_inicializada.c,Valgrind+vgdb,uninitialized-value,7,contador = 0,A variável 'contador' foi usada sem ser inicializada.
