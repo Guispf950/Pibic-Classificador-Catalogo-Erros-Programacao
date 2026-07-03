@@ -3,6 +3,38 @@ import subprocess
 import uuid
 import time
 
+
+def _stdin_para_analise(caminho_codigo):
+    """
+    Gera um stdin mínimo para exercitar o código durante análise de memória
+    (Malha 1 e 2), evitando que o processo trave aguardando input do terminal.
+
+    Lógica:
+        Reutiliza a mesma heurística da Malha 3 (detectar_parametro_escala):
+        se o código lê um inteiro N via scanf e usa como tamanho de array/laço,
+        gera a string "5\\n1 2 3 4 5\\n" — suficiente para exercitar o algoritmo
+        sem sobrecarregar a análise de memória.
+
+        Se o código não tem parâmetro de escala (entrada fixa, ex: "some 3 números"),
+        retorna None → o processo herda stdin do terminal normalmente
+        (já que esses programas geralmente terminam rápido ou leem poucos valores).
+
+    Por que N=5 e não N=100?
+        Malha 1/2 testam CORREÇÃO de memória, não desempenho. N=5 é suficiente
+        para exercitar malloc/free e detectar buffer overflow sem aumentar
+        o tempo de análise do Valgrind.
+    """
+    try:
+        from src.perfilador_desempenho import detectar_parametro_escala, gerar_entrada_para_n
+        with open(caminho_codigo, 'r', encoding='utf-8', errors='replace') as f:
+            codigo = f.read()
+        if detectar_parametro_escala(codigo):
+            return gerar_entrada_para_n(5)   # "5\n1 2 3 4 5\n"
+    except Exception:
+        pass
+    return None  # sem stdin automático — herda do ambiente
+
+
 def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
     """
     Malha 1: Compila com AddressSanitizer e executa via GDB para capturar
@@ -51,9 +83,19 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
     #      do leak e inspecionar variáveis com o GDB, gerando um log muito mais
     #      rico para a IA classificar.
     #
-    # Conclusão: a Malha 1 é especialista em erros de acesso (crashes imediatos),
-    # e a Malha 2 é especialista em vazamentos (erros silenciosos). Cada ferramenta
-    # faz o que faz melhor.
+    #     Conclusão: memory leaks são delegados ao Valgrind (Malha 2) por duas razões:
+    #
+    # (1) o Valgrind+Memcheck detecta vazamentos no heap com cobertura total,
+    #     incluindo leaks indiretos (ex: nós internos de lista encadeada) que o LSan
+    #     frequentemente classifica apenas como "still reachable" sem detalhar a cadeia;
+    #
+    # (2) o vgdb permite pausar o processo no momento exato do leak e inspecionar
+    #     variáveis com o GDB, gerando um log muito mais rico para a IA do que o
+    #     stack trace simples que o LSan produziria — mesmo que ele rodasse sem o GDB.
+    #
+    # O ponto fraco do Valgrind é a stack (erros de acesso imediatos como buffer
+    # overflow), que é exatamente o que o ASan+GDB cobre na Malha 1.
+    
     env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0"
 
     # --- FASE 3: EXECUÇÃO VIA GDB (ANÁLISE POST-MORTEM) ---
@@ -69,8 +111,20 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
         binario_saida       # caminho do executável a ser depurado
     ]
 
-    # Executa o GDB passando o ambiente com ASAN_OPTIONS configurado
-    execucao = subprocess.run(comando_gdb, env=env, capture_output=True, text=True)
+    # Detecta se o código lê N pelo stdin e gera entrada mínima automaticamente.
+    # Sem isso, programas com scanf bloqueiam esperando input do terminal.
+    stdin_analise = _stdin_para_analise(caminho_codigo)
+
+    # Executa o GDB passando o ambiente com ASAN_OPTIONS configurado.
+    # O GDB em modo --batch repassa o `input` para o processo inferior (o binário do aluno).
+    execucao = subprocess.run(
+        comando_gdb,
+        env=env,
+        capture_output=True,
+        text=True,
+        input=stdin_analise,   # None = sem input automático; string = injetado via pipe
+        timeout=60             # segurança: não pode travar indefinidamente
+    )
 
     # Junta stdout e stderr porque o GDB e o ASan podem escrever em canais diferentes
     saida_completa = execucao.stdout + execucao.stderr
@@ -121,17 +175,34 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind"):
         binario_saida
     ]
 
+    # Detecta se o código lê N pelo stdin para injetar entrada mínima automaticamente.
+    # Sem stdin, programas com scanf bloqueiam o processo do Valgrind indefinidamente.
+    stdin_analise = _stdin_para_analise(caminho_codigo)
+
     # Popen (não run) porque precisamos do processo rodando em paralelo enquanto
     # o GDB se conecta a ele. stdout/stderr capturados para leitura posterior.
+    # stdin=PIPE permite escrever o input logo após o lançamento do processo.
     processo_valgrind = subprocess.Popen(
         comando_valgrind,
+        stdin=subprocess.PIPE if stdin_analise else None,
         stderr=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True
     )
 
+    # Injeta o stdin mínimo imediatamente após o lançamento (antes do sleep).
+    # Para inputs pequenos (< alguns KB), a escrita síncrona não causa deadlock
+    # porque o kernel armazena o dado no pipe buffer enquanto o processo ainda
+    # não leu. close() após a escrita sinaliza EOF ao binário do aluno.
+    if stdin_analise and processo_valgrind.stdin:
+        try:
+            processo_valgrind.stdin.write(stdin_analise)
+            processo_valgrind.stdin.close()
+        except BrokenPipeError:
+            pass  # processo já encerrou (ex: erro antes de ler stdin)
+
     # Aguarda o Valgrind inicializar e criar o socket vgdb antes de conectar.
-    # 1.5s é uma estimativa; pode precisar de ajuste em máquinas mais lentas ou algoritmos mais "pesados".
+    # 1.5s é uma estimativa; pode precisar de ajuste em máquinas mais lentas.
     time.sleep(1.5)
 
     # --- FASE 4: CONEXÃO GDB VIA VGDB (INSPEÇÃO AO VIVO) ---
@@ -166,7 +237,12 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind"):
     # Caso 2: O programa terminou sem erros críticos — agora lemos o relatório
     # final do Valgrind buscando por vazamentos de memória que passaram despercebidos.
     # communicate() aguarda o processo terminar e coleta todo o output restante.
-    stdout_v, stderr_v = processo_valgrind.communicate()
+    # timeout=120s: segurança contra Valgrind travado (ex: programa em loop infinito).
+    try:
+        stdout_v, stderr_v = processo_valgrind.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        processo_valgrind.kill()
+        stdout_v, stderr_v = processo_valgrind.communicate()
     log_final_valgrind = stdout_v + stderr_v
 
     # "definitely lost": blocos alocados com malloc/new que nunca foram liberados
@@ -181,3 +257,4 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind"):
 
     # Nenhum erro encontrado: retorna None para indicar que o código passou nesta malha
     return None
+

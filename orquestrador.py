@@ -1,120 +1,135 @@
-import os   # Para navegar no sistema de arquivos (listar pastas, criar diretórios, montar caminhos)
-import csv  # Para gravar o relatório final no formato CSV de forma estruturada
+import os
+import csv
 
-# Importa as duas malhas de análise dinâmica: ASan+GDB (Malha 1) e Valgrind+vgdb (Malha 2)
+# Malha 1: AddressSanitizer + GDB (erros espaciais de memória)
+# Malha 2: Valgrind + vgdb (vícios semânticos: variáveis não inicializadas, leaks)
 from src.ferramentas_analise_dinamica import executar_malha_1_asan, executar_malha_2_valgrind
 
-# Importa o parser responsável por limpar/normalizar o log bruto antes de enviar à IA
+# Malha 3: Execução nativa + perf stat + regressão estatística (Big-O)
+from src.perfilador_desempenho import executar_malha_3_desempenho
+
+# Parser unificado: filtra o log bruto antes de enviar ao LLM
 from src.parser_logs import limpar_log_gdb
 
-# Importa o cliente do LLM local que classifica o erro e retorna um dicionário estruturado
+# Cliente do LLM local (Ollama) que retorna a classificação forense como JSON
 from src.llm_client import classificar_erro
 
-# Diretório onde estão os arquivos .c dos alunos a serem analisados
+# ── Configurações do pipeline ────────────────────────────────────────────────
 PASTA_CODIGOS = "./codigos_alunos"
-
-# Caminho do arquivo CSV que será gerado ao final com todos os erros catalogados
 ARQUIVO_CSV_SAIDA = "./output/catalogo_erros_codebench.csv"
 
 
 def main():
-    resultados_csv = []  # Lista que acumula um dicionário por arquivo analisado com erro
+    resultados_csv = []
 
     print("=== Iniciando Pipeline CodeBench (Modo Catálogo) ===")
-
-    # Cria a pasta ./output se ainda não existir; exist_ok=True evita erro se já existir
     os.makedirs("./output", exist_ok=True)
 
-    # Percorre todos os arquivos dentro da pasta de códigos dos alunos
     for nome_arquivo in os.listdir(PASTA_CODIGOS):
-
-        # Filtra: ignora qualquer arquivo que não seja código-fonte C
         if not nome_arquivo.endswith('.c'):
             continue
 
-        # Monta o caminho absoluto/relativo completo do arquivo para passar às ferramentas
         caminho_codigo = os.path.join(PASTA_CODIGOS, nome_arquivo)
+        print(f"\n{'─' * 90}")
+        print(f"[Analisando] {nome_arquivo}")
 
-        print(f"--------------------------------------------------------------------------------------------------")
-        print(f"\n[Analisando] {nome_arquivo}...")
+        # Campos que serão preenchidos conforme o fluxo da cascata
+        ferramenta_usada = "Nenhuma"
+        log_bruto = None
+        resultado_malha3 = None
 
-        ferramenta_usada = "Nenhuma"  # Registra qual ferramenta detectou o erro (para o CSV)
-        log_bruto = None              # Guarda o log bruto retornado pela ferramenta; None = sem erro ainda
-
-        # ── MALHA 1: AddressSanitizer + GDB ──────────────────────────────────────────
-        # Compila e executa o código instrumentado com ASan. Se houver falha de memória
-        # (buffer overflow, use-after-free, etc.), retorna um dict com a chave "log".
+        # ── MALHA 1: AddressSanitizer + GDB ──────────────────────────────────
+        # Detecta infrações físicas/espaciais (buffer overflow, use-after-free).
+        # Característica fail-fast: se detectado, aborta e não executa Malha 2/3.
         resultado = executar_malha_1_asan(caminho_codigo)
-
         if resultado:
-            # Malha 1 capturou um erro: registra a ferramenta e extrai o log bruto
             ferramenta_usada = "ASan+GDB"
             log_bruto = resultado["log"]
-        else:
-            # ── MALHA 2: Valgrind + vgdb ─────────────────────────────────────────────
-            # Código passou limpo no ASan; tenta uma segunda auditoria com Valgrind,
-            # que detecta erros mais sutis (leituras inválidas, memória não inicializada, etc.)
-            resultado = executar_malha_2_valgrind(caminho_codigo)
 
+        else:
+            # ── MALHA 2: Valgrind + vgdb ─────────────────────────────────────
+            # Detecta vícios semânticos (variáveis não inicializadas, leaks).
+            # Só roda se Malha 1 passou limpa — mesma arquitetura de cascata.
+            resultado = executar_malha_2_valgrind(caminho_codigo)
             if resultado:
-                # Malha 2 capturou um erro: registra a ferramenta e extrai o log bruto
                 ferramenta_usada = "Valgrind+vgdb"
                 log_bruto = resultado["log"]
 
-        # ── ETAPA 3: Processamento do log e classificação por IA ─────────────────────
-        # ── ETAPA 3: Processamento do log e classificação por IA ─────────────────────
+            else:
+                # ── MALHA 3: Perfilamento Algorítmico ────────────────────────
+                # Só executa se o código passou limpo nas malhas de memória.
+                # Razão arquitetural: não faz sentido auditar eficiência de um
+                # algoritmo que viola a integridade da memória — o comportamento
+                # assintótico de código com UB é tecnicamente indefinido.
+                print(f"  -> Código sem erros de memória. Executando Malha 3 (perfilamento)...")
+                resultado_malha3 = executar_malha_3_desempenho(
+                    caminho_codigo,
+                    binario_saida="./bin_nativo"
+                )
+
+        # ── ETAPA DE CLASSIFICAÇÃO POR IA ────────────────────────────────────
         if log_bruto:
             print(f"  -> Falha detectada ({ferramenta_usada}). Extraindo contexto...")
             log_limpo = limpar_log_gdb(log_bruto, nome_arquivo)
 
-            # Lê o código-fonte do aluno para enviar junto com o log à IA.
-            # Com o código em mãos, o modelo consegue correlacionar a linha do erro
-            # com a declaração real das variáveis, tipos e contexto ao redor —
-            # em vez de inferir apenas pelo backtrace do depurador.
-            # errors='replace' substitui bytes inválidos pelo caractere '?' em vez de quebrar.
-            # Necessário porque arquivos .c de alunos podem ter comentários com acentos
-            # salvos em encodings diferentes de UTF-8 (ex: latin-1, cp1252).
             with open(caminho_codigo, 'r', encoding='utf-8', errors='replace') as f:
                 codigo_fonte = f.read()
 
             print(f"  -> Acionando IA Local para classificação forense...")
-            analise_ia = classificar_erro(log_limpo, codigo_fonte)  # <-- passa o código
+            analise_ia = classificar_erro(log_limpo, codigo_fonte)
 
-            # Constrói o registro deste arquivo para o CSV.
-            # .get() com valor padrão garante que campos ausentes na resposta da IA não quebrem o pipeline.
             resultados_csv.append({
-                "Arquivo":     nome_arquivo,
-                "Ferramenta":  ferramenta_usada,
-                "Tipo Erro":   analise_ia.get("tipo_erro", "Desconhecido"),
-                "Linha":       analise_ia.get("linha_ocorrencia", "-"),
-                "Variaveis":   analise_ia.get("variaveis_envolvidas", "-"),
-                "Causa Raiz":  analise_ia.get("causa_raiz", "-"),        # <-- novo
-                "Diagnostico": analise_ia.get("descricao_curta", "-")
+                "Arquivo":         nome_arquivo,
+                "Ferramenta":      ferramenta_usada,
+                "Tipo Erro":       analise_ia.get("tipo_erro", "Desconhecido"),
+                "Linha":           analise_ia.get("linha_ocorrencia", "-"),
+                "Variaveis":       analise_ia.get("variaveis_envolvidas", "-"),
+                "Causa Raiz":      analise_ia.get("causa_raiz", "-"),
+                "Diagnostico":     analise_ia.get("descricao_curta", "-"),
+                # Malha 3 não roda quando há erro de memória (arquitetura em cascata)
+                "Complexidade":    "N/A (erro de memória detectado)",
+                "Metrica_Perf":    "-",
+                "Status_Malha3":   "não executada",
             })
+
+        elif resultado_malha3:
+            # Código passou limpo nas malhas de memória: registra resultado da Malha 3
+            status = resultado_malha3["status"]
+
+            if status == "sucesso":
+                print(f"  -> Complexidade inferida: {resultado_malha3['complexidade_inferida']}")
+            elif status == "nao_aplicavel":
+                print(f"  -> Malha 3: entrada fixa detectada — análise de complexidade N/A.")
+            elif status == "dados_insuficientes":
+                print(f"  -> Malha 3: dados insuficientes para regressão.")
+
+            resultados_csv.append({
+                "Arquivo":         nome_arquivo,
+                "Ferramenta":      "Nenhuma (passou limpo)",
+                "Tipo Erro":       "-",
+                "Linha":           "-",
+                "Variaveis":       "-",
+                "Causa Raiz":      "-",
+                "Diagnostico":     "Sem erros de memória detectados.",
+                "Complexidade":    resultado_malha3["complexidade_inferida"],
+                "Metrica_Perf":    resultado_malha3.get("metrica_usada") or "-",
+                "Status_Malha3":   status,
+            })
+
         else:
-            # Nenhuma das duas malhas detectou falha: código considerado limpo nesta auditoria
-            print("  -> Código passou limpo nas auditorias de memória.")
+            print("  -> Código passou limpo nas auditorias de memória (Malha 3 não executada).")
 
-    # ── ETAPA 4: Gravação do relatório CSV ───────────────────────────────────────────
-    if resultados_csv:  # Só grava se ao menos um erro foi encontrado durante o pipeline
-
-        # Extrai os nomes das colunas do primeiro registro (todos os dicts têm as mesmas chaves)
+    # ── GRAVAÇÃO DO RELATÓRIO CSV ─────────────────────────────────────────────
+    if resultados_csv:
         chaves = resultados_csv[0].keys()
-
-        # Abre (ou cria) o CSV de saída em modo escrita com encoding UTF-8
-        # newline='' é obrigatório com csv.DictWriter para evitar linhas em branco no Windows
         with open(ARQUIVO_CSV_SAIDA, 'w', newline='', encoding='utf-8') as f:
-
-            # DictWriter mapeia automaticamente cada chave do dicionário para a coluna correta
             writer = csv.DictWriter(f, fieldnames=chaves)
-
-            writer.writeheader()       # Escreve a linha de cabeçalho com os nomes das colunas
-            writer.writerows(resultados_csv)  # Escreve todas as linhas de dados de uma vez
-
+            writer.writeheader()
+            writer.writerows(resultados_csv)
         print(f"\n=== Sucesso! Catálogo salvo em: {ARQUIVO_CSV_SAIDA} ===")
+    else:
+        print("\n=== Nenhum resultado a registrar no CSV. ===")
 
 
-# Ponto de entrada do script: garante que main() só é chamada quando executado diretamente,
-# não quando o módulo é importado por outro arquivo Python
 if __name__ == "__main__":
     main()
