@@ -2,11 +2,10 @@ import os
 import csv
 
 # Malha 1: AddressSanitizer + GDB (erros espaciais de memória)
-# Malha 2: Valgrind + vgdb (vícios semânticos: variáveis não inicializadas, leaks)
-from src.ferramentas_analise_dinamica import executar_malha_1_asan, executar_malha_2_valgrind
+from src.malha1_asan import executar_malha_1_asan
 
-# Malha 3: Execução nativa + perf stat + regressão estatística (Big-O)
-from src.perfilador_desempenho import executar_malha_3_desempenho
+# Malha 2: Valgrind + vgdb (vícios semânticos: variáveis não inicializadas, leaks)
+from src.malha2_valgrind import executar_malha_2_valgrind
 
 # Parser unificado: filtra o log bruto antes de enviar ao LLM
 from src.parser_logs import limpar_log_gdb
@@ -36,11 +35,10 @@ def main():
         # Campos que serão preenchidos conforme o fluxo da cascata
         ferramenta_usada = "Nenhuma"
         log_bruto = None
-        resultado_malha3 = None
 
         # ── MALHA 1: AddressSanitizer + GDB ──────────────────────────────────
         # Detecta infrações físicas/espaciais (buffer overflow, use-after-free).
-        # Característica fail-fast: se detectado, aborta e não executa Malha 2/3.
+        # Característica fail-fast: se detectado, aborta e não executa a Malha 2.
         resultado = executar_malha_1_asan(caminho_codigo)
         if resultado:
             ferramenta_usada = "ASan+GDB"
@@ -49,23 +47,11 @@ def main():
         else:
             # ── MALHA 2: Valgrind + vgdb ─────────────────────────────────────
             # Detecta vícios semânticos (variáveis não inicializadas, leaks).
-            # Só roda se Malha 1 passou limpa — mesma arquitetura de cascata.
+            # Só roda se a Malha 1 passou limpa — arquitetura em cascata.
             resultado = executar_malha_2_valgrind(caminho_codigo)
             if resultado:
                 ferramenta_usada = "Valgrind+vgdb"
                 log_bruto = resultado["log"]
-
-            else:
-                # ── MALHA 3: Perfilamento Algorítmico ────────────────────────
-                # Só executa se o código passou limpo nas malhas de memória.
-                # Razão arquitetural: não faz sentido auditar eficiência de um
-                # algoritmo que viola a integridade da memória — o comportamento
-                # assintótico de código com UB é tecnicamente indefinido.
-                print(f"  -> Código sem erros de memória. Executando Malha 3 (perfilamento)...")
-                resultado_malha3 = executar_malha_3_desempenho(
-                    caminho_codigo,
-                    binario_saida="./bin_nativo"
-                )
 
         # ── ETAPA DE CLASSIFICAÇÃO POR IA ────────────────────────────────────
         if log_bruto:
@@ -79,45 +65,27 @@ def main():
             analise_ia = classificar_erro(log_limpo, codigo_fonte)
 
             resultados_csv.append({
-                "Arquivo":         nome_arquivo,
-                "Ferramenta":      ferramenta_usada,
-                "Tipo Erro":       analise_ia.get("tipo_erro", "Desconhecido"),
-                "Linha":           analise_ia.get("linha_ocorrencia", "-"),
-                "Variaveis":       analise_ia.get("variaveis_envolvidas", "-"),
-                "Causa Raiz":      analise_ia.get("causa_raiz", "-"),
-                "Diagnostico":     analise_ia.get("descricao_curta", "-"),
-                # Malha 3 não roda quando há erro de memória (arquitetura em cascata)
-                "Complexidade":    "N/A (erro de memória detectado)",
-                "Metrica_Perf":    "-",
-                "Status_Malha3":   "não executada",
-            })
-
-        elif resultado_malha3:
-            # Código passou limpo nas malhas de memória: registra resultado da Malha 3
-            status = resultado_malha3["status"]
-
-            if status == "sucesso":
-                print(f"  -> Complexidade inferida: {resultado_malha3['complexidade_inferida']}")
-            elif status == "nao_aplicavel":
-                print(f"  -> Malha 3: entrada fixa detectada — análise de complexidade N/A.")
-            elif status == "dados_insuficientes":
-                print(f"  -> Malha 3: dados insuficientes para regressão.")
-
-            resultados_csv.append({
-                "Arquivo":         nome_arquivo,
-                "Ferramenta":      "Nenhuma (passou limpo)",
-                "Tipo Erro":       "-",
-                "Linha":           "-",
-                "Variaveis":       "-",
-                "Causa Raiz":      "-",
-                "Diagnostico":     "Sem erros de memória detectados.",
-                "Complexidade":    resultado_malha3["complexidade_inferida"],
-                "Metrica_Perf":    resultado_malha3.get("metrica_usada") or "-",
-                "Status_Malha3":   status,
+                "Arquivo":       nome_arquivo,
+                "Ferramenta":    ferramenta_usada,
+                "Tipo Erro":     analise_ia.get("tipo_erro", "Desconhecido"),
+                "Linha":         analise_ia.get("linha_ocorrencia", "-"),
+                "Variaveis":     analise_ia.get("variaveis_envolvidas", "-"),
+                "Causa Raiz":    analise_ia.get("causa_raiz", "-"),
+                "Diagnostico":   analise_ia.get("descricao_curta", "-"),
             })
 
         else:
-            print("  -> Código passou limpo nas auditorias de memória (Malha 3 não executada).")
+            # Código passou limpo em ambas as malhas de memória.
+            print("  -> Código passou limpo nas auditorias de memória (ASan e Valgrind).")
+            resultados_csv.append({
+                "Arquivo":       nome_arquivo,
+                "Ferramenta":    "Nenhuma (passou limpo)",
+                "Tipo Erro":     "-",
+                "Linha":         "-",
+                "Variaveis":     "-",
+                "Causa Raiz":    "-",
+                "Diagnostico":   "Sem erros de memória detectados.",
+            })
 
     # ── GRAVAÇÃO DO RELATÓRIO CSV ─────────────────────────────────────────────
     if resultados_csv:
