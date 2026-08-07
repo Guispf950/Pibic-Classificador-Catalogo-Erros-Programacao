@@ -9,9 +9,20 @@ Memory leaks são intencionalmente delegados à Malha 2 (Valgrind+vgdb).
 """
 
 import os
+import re
 import subprocess
 
 from src.deteccao_entrada import stdin_para_analise
+
+
+# Sinais fatais que o GDB pode interceptar ANTES de o ASan imprimir seu relatório.
+# Um crash "cru" (ex.: deref de ponteiro nulo -> SIGSEGV) é entregue ao GDB como um
+# sinal do SO; sob `gdb --batch`, o GDB para o processo no ponto da falha e o handler
+# do ASan não chega a rodar. Logo, a string "ERROR: AddressSanitizer" NÃO aparece e o
+# erro escaparia da detecção se olhássemos só por ela. Por isso também reconhecemos os
+# sinais reportados pelo GDB. (SIGABRT entra aqui porque é o que o ASan usa ao abortar,
+# cobrindo o caso raro em que o relatório do ASan não é capturado por buffering.)
+_SINAIS_FATAIS = ("SIGSEGV", "SIGABRT", "SIGFPE", "SIGBUS", "SIGILL", "SIGSYS", "SIGTRAP")
 
 
 def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
@@ -20,7 +31,7 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
     inválido (buffer overflow, use-after-free, stack overflow).
     Retorna um dict com 'erro' e 'log' se algo for detectado, ou None se limpo.
 
-    NOTA: Memory leaks são intencionalmente delegados à Malha 2 (Valgrind+vgdb).
+    NOTA: Memory leaks são delegados à Malha 2 (Valgrind+vgdb).
     """
 
     # --- FASE 1: COMPILAÇÃO COM ASAN ---
@@ -28,15 +39,38 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
     # na memória. Qualquer acesso fora dos limites faz o programa abortar imediatamente.
     # -g preserva os símbolos de depuração (nomes de variáveis, números de linha)
     # para que o GDB consiga gerar um backtrace legível depois.
+    # -std=gnu11: fixa o padrão da linguagem para casar com o ambiente do CodeBench.
+    # Sem isso, o GCC usa o default da versão instalada localmente (GCC recente => C23),
+    # no qual `false`, `true` e `bool` viraram PALAVRAS-CHAVE. Códigos legados que fazem
+    # `typedef enum { false, true } bool;` (válido em C99/C11/C17) passam a quebrar na
+    # compilação, gerando FALSOS POSITIVOS que não ocorrem no juiz. gnu11 reproduz o
+    # comportamento esperado do CodeBench e ainda mantém as extensões GNU usuais.
+    # Flags adicionais para melhorar a IDENTIFICAÇÃO DA ORIGEM (causa raiz):
+    #   -fsanitize-address-use-after-scope: detecta o uso de uma variável local
+    #       DEPOIS de ela sair de escopo (ex.: retornar o endereço de algo dentro de
+    #       um bloco { } que já fechou). Sem essa flag, esse erro passa despercebido.
+    #   -fno-omit-frame-pointer: preserva o "frame pointer" em cada função, o que dá
+    #       backtraces mais fiéis (linha/função corretas) — essencial para apontar com
+    #       precisão tanto o SINTOMA quanto a ORIGEM do erro.
     compilacao = subprocess.run(
-        ["gcc", "-fsanitize=address", "-g", caminho_codigo, "-o", binario_saida],
+        ["gcc", "-std=gnu11",
+         "-fsanitize=address",
+         "-fsanitize-address-use-after-scope",   # novo: erros de uso fora de escopo
+         "-fno-omit-frame-pointer",               # novo: backtraces mais precisos
+         "-g", caminho_codigo, "-o", binario_saida],
         capture_output=True,  # captura stdout e stderr sem exibir no terminal
         text=True             # decodifica a saída como string (não bytes)
     )
 
-    # Se o código não compilou, não há nada a executar — retorna o erro do compilador
+    # Se o código não compilou, não há nada a executar — retorna o erro do compilador.
+    # tipo="compilacao" permite ao orquestrador tratar isto como uma CATEGORIA PRÓPRIA
+    # (não é erro de memória, nem foi o ASan/GDB que o encontrou, e sim o gcc).
     if compilacao.returncode != 0:
-        return {"erro": "Erro de compilação", "log": compilacao.stderr}
+        return {
+            "tipo": "compilacao",
+            "erro": "Erro de compilação",
+            "log": compilacao.stderr,
+        }
 
     # --- FASE 2: CONFIGURAÇÃO DO AMBIENTE ---
     # Copia as variáveis de ambiente do processo atual para não perder PATH, HOME etc.
@@ -47,7 +81,7 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
     # da memória (backtrace + variáveis locais) no momento da falha.
     #
     # detect_leaks=0: desabilita o LeakSanitizer (LSan) intencionalmente.
-    # Isso não é uma limitação — é uma decisão arquitetural do pipeline:
+    # Isso  é uma decisão de arquitetura do pipeline:
     #
     #   1. INCOMPATIBILIDADE TÉCNICA: O LSan usa ptrace para rastrear o heap.
     #      O GDB também usa ptrace para depurar o processo. Dois usuários de ptrace
@@ -101,7 +135,7 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
         env=env,
         capture_output=True,
         text=True,
-        input=stdin_analise,   # None = sem input automático; string = injetado via pipe
+        input=stdin_analise,   # Usa o caso de teste fornecido pelo codebench. Se: None = sem input automático; string = injetado via pipe (ex: "5\n1 2 3 4 5\n")
         timeout=60             # segurança: não pode travar indefinidamente
     )
 
@@ -109,11 +143,37 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
     saida_completa = execucao.stdout + execucao.stderr
 
     # --- FASE 4: ANÁLISE DO RESULTADO ---
-    # Verifica apenas erros de acesso inválido (Stack e Heap) — leaks são tratados pela Malha 2.
-    # "ERROR: AddressSanitizer" cobre: buffer overflow, use-after-free,
-    # stack-buffer-overflow, global-buffer-overflow, use-after-return, etc.
+    #
+    # (A) RELATÓRIO DO ASAN.
+    # "ERROR: AddressSanitizer" cobre os erros que o ASan consegue interceptar e
+    # RELATAR antes de abortar: buffer overflow, use-after-free, stack/global overflow,
+    # use-after-return, etc. Nesses casos o relatório do ASan (com linha e função) já
+    # está na saída — é o log mais rico possível. Leaks ficam de fora (detect_leaks=0).
     if "ERROR: AddressSanitizer" in saida_completa:
-        return {"erro": "Detectado pelo ASan", "log": saida_completa}
+        return {
+            "tipo": "asan",
+            "erro": "Detectado pelo ASan",
+            "log": saida_completa,
+        }
 
-    # Nenhum erro de acesso encontrado: passa para a Malha 2 (Valgrind)
+    # (B) CRASH POR SINAL CAPTURADO PELO GDB.
+    # Quando o programa sofre um crash "cru" (ex.: deref de ponteiro nulo -> SIGSEGV),
+    # o SINAL chega primeiro ao GDB, que para o processo no ponto da falha. Nesse fluxo
+    # o handler do ASan NÃO roda, então "ERROR: AddressSanitizer" fica ausente e o teste
+    # (A) falha — foi exatamente o que fez crashes escaparem para a Malha 2 e saírem como
+    # "indeterminado". Aqui recuperamos esse caso lendo a linha que o GDB imprime:
+    #     "Program received signal SIGSEGV, Segmentation fault."
+    # O `bt full` que pedimos ao GDB já deixou o backtrace (com arquivo:linha e função)
+    # na mesma saída, então o log continua rico o suficiente para a IA classificar.
+    match_sinal = re.search(r"signal\s+(SIG[A-Z]+)", saida_completa)
+    if match_sinal and match_sinal.group(1) in _SINAIS_FATAIS:
+        sinal = match_sinal.group(1)
+        return {
+            "tipo": "crash",
+            "erro": f"Crash por {sinal} capturado via GDB",
+            "sinal": sinal,
+            "log": saida_completa,
+        }
+
+    # Nenhum erro de acesso nem crash encontrado: passa para a Malha 2 (Valgrind)
     return None

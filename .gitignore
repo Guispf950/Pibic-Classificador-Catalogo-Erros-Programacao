@@ -1,0 +1,27 @@
+# ─── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ─── Binários compilados pelo pipeline (ASan / Valgrind) ──────────────────
+# São regenerados a cada execução das malhas — não fazem parte do código.
+bin_asan
+bin_valgrind
+bin_*
+
+# ─── Saídas TRANSITÓRIAS de uma rodada ────────────────────────────────────
+# O catálogo e os .c anotados de trabalho são regenerados a cada execução.
+# Resultados que EMBASAM conclusões vão versionados em experiments/, não aqui.
+output/
+
+# ─── Temporários do vgdb e do sistema ─────────────────────────────────────
+vgdb_*
+desktop.ini
+.DS_Store
+Thumbs.db
+
+# NOTA: as submissões dos alunos (codigos_alunos/) SÃO versionadas de propósito
+# (repositório privado). Não há regra ignorando-as.

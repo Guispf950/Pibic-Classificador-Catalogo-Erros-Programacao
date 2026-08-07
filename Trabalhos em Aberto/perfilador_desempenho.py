@@ -7,8 +7,8 @@ Implementa o Perfilamento Algorítmico conforme descrito na arquitetura proposta
 IDEIA CENTRAL:
     Em vez de medir o tempo de parede (que varia com a carga do servidor),
     submetemos o binário a entradas de tamanho crescente (N=10, 100, 1000...)
-    e contamos quantas instruções de máquina a CPU executou para cada N.
-    Com esses pontos, uma regressão estatística infere a curva Big-O.
+    e contamos quantas instruções o CÓDIGO DO ALUNO executou para cada N
+    (isolando-o do I/O da libc). Com esses pontos, uma regressão infere a curva Big-O.
 
 DOIS CENÁRIOS POSSÍVEIS:
     Cenário A — Exercício com template CodeBench (ex: "leia N e ordene N números"):
@@ -21,6 +21,9 @@ DOIS CENÁRIOS POSSÍVEIS:
 """
 
 import re
+import os                       # usado para manipular caminhos e o arquivo temporário do callgrind
+import shutil                   # remove o diretório temporário do binário nativo ao final
+import tempfile                 # cria arquivos/dirs temporários (relatório do callgrind e binário nativo)
 import subprocess
 import warnings
 
@@ -29,49 +32,47 @@ from scipy.optimize import curve_fit
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PRÉ-CHECK: DISPONIBILIDADE DO PERF
+# PRÉ-CHECK: DISPONIBILIDADE DO CALLGRIND (VALGRIND)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _perf_disponivel():
+def _callgrind_disponivel():
     """
-    Verifica em <3s se `perf stat` está funcional neste ambiente.
+    Verifica se o Valgrind (ferramenta Callgrind) está instalado neste ambiente.
 
-    Por que não confiar no FileNotFoundError do coletar_instrucoes_perf?
-        Em WSL e alguns ambientes de CI, o binário `perf` existe mas trava
-        ao tentar acessar hardware performance counters (PEBS, PMU) que o
-        hypervisor não expõe. Em vez de falhar rápido com um erro, o processo
-        fica suspenso aguardando o kernel — até o timeout de 30s ser atingido.
-        Com 7 tamanhos de escala + 1 sonda, isso resulta em 8 × 30s = ~4min
-        de travamento antes do fallback de tempo ser ativado.
+    Por que Callgrind e não `perf` ou Cachegrind?
+        O `perf` lê Contadores de Hardware (PMU), indisponíveis em WSL/contêineres.
+        O Cachegrind conta instruções por emulação (funciona sem PMU), mas só dá o
+        TOTAL do programa — que mistura o algoritmo com o I/O (scanf/printf).
+        O Callgrind também conta por emulação, porém atribui as instruções POR
+        FUNÇÃO e POR OBJETO (executável x libc). Isso permite somar só o que rodou
+        no binário do aluno e descartar a libc, isolando o custo do algoritmo.
 
-    Solução: rodar `perf stat -- true` (binário que encerra instantaneamente)
-        com timeout curto. Se responder em <3s, perf está funcional.
-        Se travar ou falhar, assume indisponível e vai direto para o fallback.
+    A verificação é leve (`valgrind --version`); a robustez do parsing fica na
+    própria coletar_instrucoes_callgrind().
     """
     try:
         resultado = subprocess.run(
-            ["perf", "stat", "--", "true"],
+            ["valgrind", "--version"],
             capture_output=True,
             text=True,
-            timeout=3          # 3s é mais que suficiente para `true` terminar
+            timeout=5          # `valgrind --version` responde instantaneamente
         )
-        # Verifica se a saída contém o marcador de sucesso do perf
-        return "Performance counter stats" in resultado.stderr
+        return "valgrind" in (resultado.stdout + resultado.stderr).lower()
     except Exception:
         return False
 
 
 # Cache do resultado: executado uma vez por processo, evita re-check a cada medição
-_PERF_DISPONIVEL: bool | None = None
+_CALLGRIND_DISPONIVEL: bool | None = None
 
-def _checar_perf():
-    """Retorna (e cacheia) a disponibilidade do perf para este processo."""
-    global _PERF_DISPONIVEL
-    if _PERF_DISPONIVEL is None:
-        _PERF_DISPONIVEL = _perf_disponivel()
-        status = "disponível" if _PERF_DISPONIVEL else "indisponível — usando fallback de tempo"
-        print(f"  -> [Malha 3] perf stat: {status}")
-    return _PERF_DISPONIVEL
+def _checar_callgrind():
+    """Retorna (e cacheia) a disponibilidade do Callgrind para este processo."""
+    global _CALLGRIND_DISPONIVEL
+    if _CALLGRIND_DISPONIVEL is None:
+        _CALLGRIND_DISPONIVEL = _callgrind_disponivel()
+        status = "disponível" if _CALLGRIND_DISPONIVEL else "indisponível — usando fallback de tempo"
+        print(f"  -> [Malha 3] Callgrind (contagem de instruções do aluno): {status}")
+    return _CALLGRIND_DISPONIVEL
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -167,56 +168,114 @@ def gerar_entrada_para_n(N, formato="N_ESPACO_VALORES"):
 # BLOCO 3 — COLETA DE MÉTRICAS DE DESEMPENHO
 # ══════════════════════════════════════════════════════════════════════════════
 
-def coletar_instrucoes_perf(binario, stdin_input, timeout=30):
+def _somar_ir_do_binario(caminho_out, nome_binario):
     """
-    Executa o binário com `perf stat` e retorna o total de instruções de máquina
-    executadas pela CPU (Hardware Performance Counter — HPC).
-
-    Por que instruções e não tempo?
-        Instruções são determinísticas: o mesmo código com a mesma entrada
-        executa sempre o mesmo número de instruções, independente da carga
-        do servidor. O tempo de parede varia com o scheduler do SO.
-
-    Retorna o número de instruções (int) ou None se perf não estiver disponível.
+    Usa a ferramenta nativa `callgrind_annotate` para fazer o parsing.
+    Delega ao Valgrind a tarefa complexa de descomprimir IDs e grafos de chamadas,
+    lendo o resultado já processado, limpo e formatado.
     """
-    # Curto-circuito: se o pre-check já sabe que perf não está disponível,
-    # não tenta — evita o travamento de 30s que ocorre em WSL/CI sem PMU.
-    if not _checar_perf():
-        return None
+    import subprocess
+    
+    total = 0
+    alvo = f"[{nome_binario}]"  # ex: "[/tmp/malha3_xyz/bin_nativo]"
 
     try:
+        # --threshold=100 é CRÍTICO: garante que TODAS as funções sejam listadas, 
+        # mesmo as minúsculas que consomem < 0.1% (essencial para N pequenos como N=100).
         resultado = subprocess.run(
-            # "instructions:u" — conta apenas instruções do espaço do usuário,
-            # excluindo syscalls do kernel (que seriam ruído para a análise do algoritmo)
-            ["perf", "stat", "-e", "instructions:u", "--", binario],
-            input=stdin_input,       # injeta a entrada gerada pelo gerar_entrada_para_n()
-            capture_output=True,     # captura stdout e stderr sem exibir no terminal
+            ["callgrind_annotate", "--threshold=100", caminho_out],
+            capture_output=True,
             text=True,
-            timeout=timeout
+            check=True
+        )
+        
+        # O output do callgrind_annotate tem o formato:
+        # 405,220 (11.08%)  arquivo.c:particionar [/tmp/bin_nativo]
+        for linha in resultado.stdout.splitlines():
+            linha_limpa = linha.rstrip()
+            
+            # As linhas de sumário de função terminam sempre com o nome do objeto entre parêntesis retos
+            if linha_limpa.endswith(alvo):
+                partes = linha_limpa.split()
+                
+                if len(partes) >= 3:
+                    # A 1ª coluna é a contagem de instruções (removemos as vírgulas)
+                    ir_str = partes[0].replace(',', '')
+                    
+                    # A penúltima coluna contém a assinatura (ex: "arquivo.c:nome_da_funcao" ou apenas "nome_da_funcao")
+                    assinatura = partes[-2]
+                    nome_fn = assinatura.split(':')[-1]
+                    
+                    # Remove o ruído: ignora a 'main' e funções internas de arranque do C (ex: _start, _init)
+                    # Ou seja, ele exclui três coisas:
+                    # a  libc (scanf/printf/malloc) → por serem outro objeto;
+                    # o main → excluído explicitamente pelo nome;
+                    # as funções de arranque (_start, __libc_csu_init, etc.) → excluídas pelo prefixo _.
+                    if nome_fn != 'main' and not nome_fn.startswith('_'):
+                        try:
+                            total += int(ir_str)
+                        except ValueError:
+                            pass
+                            
+    except Exception as e:
+        print(f"Erro ao processar callgrind_annotate: {e}")
+        
+    return total
+def coletar_instrucoes_callgrind(binario, stdin_input, timeout=180):
+    """
+    Executa o binário sob o Callgrind (Valgrind) e retorna o total de instruções
+    (Ir) executadas SOMENTE dentro do binário do aluno, isolando o algoritmo do
+    custo de I/O (scanf/printf) e de inicialização, que ficam na libc.
+
+    Por que Callgrind por objeto e não o total do Cachegrind?
+        O total do programa é dominado pelo I/O (O(N)), que mascara o algoritmo.
+        O Callgrind atribui o custo por função/objeto; somando só o objeto do
+        aluno, o I/O da libc sai fora e a complexidade real fica visível.
+
+    Custo: a emulação do Valgrind é ~20–100× mais lenta que a execução nativa;
+        por isso o timeout é generoso e a escala de N é contida.
+
+    Retorna o número de instruções (int) ou None se o Callgrind não estiver
+    disponível ou falhar.
+    """
+    # Curto-circuito: se o pré-check já sabe que o Valgrind não está disponível.
+    if not _checar_callgrind():
+        return None
+
+    # Cria um arquivo temporário para receber o relatório detalhado do callgrind.
+    fd, caminho_out = tempfile.mkstemp(prefix="callgrind_", suffix=".out")  # (descritor, caminho)
+    os.close(fd)                 # só queremos o caminho; quem escreve no arquivo é o valgrind
+
+    try:
+        subprocess.run(
+            [
+                "valgrind", "--tool=callgrind",          # usa o Callgrind (conta Ir por função/objeto)
+                "--cache-sim=no", "--branch-sim=no",     # sem simular cache/desvio: só a contagem de instruções (evento Ir)
+                "--callgrind-out-file=" + caminho_out,   # grava o relatório neste arquivo temporário
+                binario                                  # executável do aluno a ser perfilado
+            ],
+            input=stdin_input,       # injeta a entrada gerada pelo gerar_entrada_para_n()
+            capture_output=True,     # não polui o terminal com a saída do programa/valgrind
+            text=True,
+            timeout=timeout          # teto de tempo (a emulação é lenta para N grande)
         )
 
-        # O perf stat SEMPRE escreve suas métricas no stderr (por design da ferramenta),
-        # mesmo que o programa medido escreva no stdout
-        saida = resultado.stderr
-
-        # Extrai o número de instruções da linha "1,234,567,890  instructions:u"
-        # O padrão aceita tanto vírgula (en_US) quanto ponto (pt_BR) como separador de milhar
-        match = re.search(r'([\d,\.]+)\s+instructions', saida)
-        if match:
-            # Remove separadores de milhar e converte para int
-            raw = match.group(1).replace(',', '').replace('.', '')
-            return int(raw)
+        # Faz o parsing do arquivo somando o Ir só do binário do aluno (exclui libc).
+        total = _somar_ir_do_binario(caminho_out, binario)
+        return total if total > 0 else None   # 0 = nada casou (falha de parsing) -> trata como None
 
     except FileNotFoundError:
-        pass  # `perf` não está instalado no sistema — cai para o fallback de tempo
+        return None   # `valgrind` não está instalado — cai para o fallback de tempo
     except subprocess.TimeoutExpired:
-        pass  # programa travou neste N — descarta o ponto e continua
-    except (ValueError, AttributeError):
-        pass  # parsing do número falhou — descarta o ponto
+        return None   # a emulação estourou o tempo neste N — descarta o ponto
     except Exception:
-        pass  # qualquer outro erro inesperado — descarta silenciosamente
-
-    return None  # sinaliza que o perf não está disponível ou falhou
+        return None   # qualquer outro erro inesperado — descarta silenciosamente
+    finally:
+        # Remove o arquivo temporário (com ou sem sucesso) para não acumular lixo em /tmp.
+        try:
+            os.remove(caminho_out)
+        except OSError:
+            pass
 
 
 # Piso de ruído do fallback de tempo: medições abaixo de 2ms estão no overhead
@@ -227,18 +286,14 @@ LIMIAR_RUIDO_NS = 2_000_000  # 2 ms em nanosegundos
 
 def coletar_tempo_parede_ns(binario, stdin_input, n_medicoes=5, timeout=15):
     """
-    Fallback quando `perf stat` não está disponível.
+    Fallback quando o Callgrind não está disponível.
 
     Mede o tempo de execução usando perf_counter_ns() (resolução de nanosegundos)
-    e retorna a MEDIANA de 9 medições para reduzir o jitter do scheduler do SO.
+    e retorna a MEDIANA de 5 medições para reduzir o jitter do scheduler do SO.
 
     Por que mediana e não média?
         A média é sensível a outliers (picos de latência do SO).
         A mediana representa a execução "típica" sem ser distorcida por picos.
-
-    Por que 9 medições?
-        Número ímpar facilita o cálculo da mediana. Com 9 amostras, o erro
-        estatístico já é pequeno o suficiente para a regressão Big-O.
 
     Retorna o tempo mediano em nanosegundos (int) ou None se < 3 execuções bem-sucedidas.
     """
@@ -275,8 +330,8 @@ def coletar_metrica(binario, stdin_input):
     """
     Seleciona e executa a melhor métrica disponível para medir o custo do algoritmo:
 
-    1ª opção: perf stat (HPC) — instruções reais da CPU, determinístico
-    2ª opção: mediana de tempo de parede em ns — usado quando perf não está disponível
+    1ª opção: Callgrind (instruções do aluno, "Ir" por objeto) — determinístico, isola o algoritmo do I/O
+    2ª opção: mediana de tempo de parede em ns — usado quando o Callgrind não está disponível
 
     Se o tempo medido for menor que LIMIAR_RUIDO_NS (2ms), descarta o ponto:
     ele está no piso de overhead do subprocess, não no algoritmo.
@@ -284,10 +339,10 @@ def coletar_metrica(binario, stdin_input):
     Retorna (valor, fonte) onde fonte identifica qual método foi usado,
     ou (None, None) se ambos falharem ou o valor estiver abaixo do limiar.
     """
-    # Tenta primeiro o método de referência (HPC via perf)
-    instrucoes = coletar_instrucoes_perf(binario, stdin_input)
+    # Tenta primeiro o método de referência (instruções do aluno via Callgrind, por objeto)
+    instrucoes = coletar_instrucoes_callgrind(binario, stdin_input)
     if instrucoes is not None:
-        return instrucoes, "perf_stat"  # retorna imediatamente com o melhor método
+        return instrucoes, "callgrind (Ir aluno)"  # retorna imediatamente com o melhor método
 
     # Fallback: mediana de tempo de parede em nanosegundos
     tempo_ns = coletar_tempo_parede_ns(binario, stdin_input)
@@ -329,7 +384,7 @@ def inferir_big_o(resultados, entradas):
 
     # Garante que as chaves do dict são int (evita bug de float key vs int key)
     ns_validos = [n for n in entradas if int(n) in resultados]
-    x_data = np.array(ns_validos, dtype=float)                            # valores de N (eixo X)
+    x_data = np.array(ns_validos, dtype=float)                             # valores de N (eixo X)
     y_data = np.array([resultados[int(n)] for n in ns_validos], dtype=float)  # métricas (eixo Y)
 
     # Normaliza Y para o intervalo [0, 1] dividindo pelo máximo.
@@ -341,44 +396,37 @@ def inferir_big_o(resultados, entradas):
     # Famílias assintóticas testadas — cobrindo os casos típicos de CS1/CS2
     # Cada lambda é f(x, c) = c * g(x), onde c é o parâmetro livre ajustado
     modelos = {
-        "O(1) - Constante":        lambda x, c: c * np.ones_like(x),              # custo fixo, independente de N
-        "O(log N) - Logarítmica":  lambda x, c: c * np.log2(np.maximum(x, 1.0)), # busca binária, árvores balanceadas
-        "O(N) - Linear":           lambda x, c: c * x,                            # varredura simples de array
-        "O(N log N) - Log-Linear": lambda x, c: c * x * np.log2(np.maximum(x, 1.0)),  # mergesort, quicksort médio
-        "O(N²) - Quadrática":      lambda x, c: c * (x ** 2),                    # bubble sort, seleção, inserção
-        "O(N³) - Cúbica":          lambda x, c: c * (x ** 3),                    # multiplicação de matrizes ingênua
-        "O(2^N) - Exponencial":    lambda x, c: c * (2.0 ** np.minimum(x, 60.0)), # recursão sem memoização (ex: fibonacci ingênuo)
-        # np.minimum(..., 60) evita overflow de float para N grande
-    }
+        "O(1) - Constante":        lambda x, c, c0: c * np.ones_like(x) + c0,
+        "O(log N) - Logarítmica":  lambda x, c, c0: c * np.log2(np.maximum(x, 1.0)) + c0,
+        "O(N) - Linear":           lambda x, c, c0: c * x + c0,
+        "O(N log N) - Log-Linear": lambda x, c, c0: c * x * np.log2(np.maximum(x, 1.0)) + c0,
+        "O(N²) - Quadrática":      lambda x, c, c0: c * (x ** 2) + c0,
+        "O(N³) - Cúbica":          lambda x, c, c0: c * (x ** 3) + c0,
+        "O(2^N) - Exponencial":    lambda x, c, c0: c * (2.0 ** np.minimum(x, 60.0)) + c0,
+    }   
 
     melhor_modelo = "Indeterminada"
-    melhor_r2 = -float('inf')  # inicializa com menos infinito para que qualquer R² seja melhor
+    melhor_r2 = -float('inf')
 
-    warnings.filterwarnings("ignore")  # suprime avisos de convergência do curve_fit durante a busca
+    warnings.filterwarnings("ignore")
     for nome, func in modelos.items():
         try:
-            # Ajusta os parâmetros da função ao conjunto de dados.
-            # p0=[1.0] é o chute inicial para o parâmetro c — 1.0 é seguro para dados normalizados.
-            # maxfev=20000 aumenta o limite de iterações para curvas difíceis de convergir (ex: exponencial).
-            popt, _ = curve_fit(func, x_data, y_norm, p0=[1.0], maxfev=20000)
+            # Agora p0 precisa de dois palpites iniciais [c, c0]
+            # Usamos [1.0, 0.1] como ponto de partida seguro para dados normalizados
+            popt, _ = curve_fit(func, x_data, y_norm, p0=[1.0, 0.1], maxfev=20000)
 
-            # Calcula os valores preditos pelo modelo com o parâmetro c ajustado
             y_pred = func(x_data, *popt)
 
-            # Calcula R² = 1 - (SS_res / SS_tot)
-            ss_res = np.sum((y_norm - y_pred) ** 2)  # soma dos quadrados dos resíduos (erro do modelo)
-            ss_tot = np.sum((y_norm - np.mean(y_norm)) ** 2)  # variância total dos dados
-
-            # Se ss_tot == 0, todos os pontos têm o mesmo valor → R² = 1 (ajuste perfeito por definição)
+            ss_res = np.sum((y_norm - y_pred) ** 2)
+            ss_tot = np.sum((y_norm - np.mean(y_norm)) ** 2)
             r2 = 1.0 - (ss_res / ss_tot) if ss_tot != 0 else 1.0
 
-            # Atualiza o melhor modelo se este R² for o maior encontrado até agora
             if r2 > melhor_r2:
                 melhor_r2 = r2
                 melhor_modelo = nome
 
         except Exception:
-            continue  # modelo não convergiu para estes dados — ignora e testa o próximo
+            continue
 
     warnings.resetwarnings()  # restaura o filtro de warnings após a busca
 
@@ -396,9 +444,10 @@ def inferir_big_o(resultados, entradas):
 # BLOCO 5 — ORQUESTRAÇÃO DA MALHA 3
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Escala preferencial quando perf stat está disponível.
-# Começa em N=10 porque o perf conta instruções absolutas — sinal mensurável desde entradas pequenas.
-TAMANHOS_ESCALA_PERF = [10, 50, 100, 500, 1000, 5000, 10000]
+# Escala usada com o Callgrind. A contagem de instruções é exata e determinística
+# desde entradas pequenas, então não é preciso N gigante; como a emulação é lenta
+# (~20–100×), limitamos o teto para a análise completar em tempo razoável.
+TAMANHOS_ESCALA_INSTRUCOES = [100, 500, 1000, 2000, 5000, 10000]
 
 # Escala usada no fallback de tempo de parede.
 # Valores menores para que a análise complete em segundos, não minutos.
@@ -406,10 +455,10 @@ TAMANHOS_ESCALA_PERF = [10, 50, 100, 500, 1000, 5000, 10000]
 TAMANHOS_ESCALA_TIME = [100, 200, 1_000, 2_000, 4_000]
 
 # Alias de compatibilidade — mantido caso algum módulo importe TAMANHOS_ESCALA diretamente
-TAMANHOS_ESCALA = TAMANHOS_ESCALA_PERF
+TAMANHOS_ESCALA = TAMANHOS_ESCALA_INSTRUCOES
 
 
-def executar_malha_3_desempenho(caminho_codigo, binario_saida="./bin_nativo"):
+def executar_malha_3_desempenho(caminho_codigo):
     """
     Orquestra as três fases do perfilamento algorítmico:
       1. Compila o código sem instrumentação (execução pura, sem overhead de ASan/Valgrind)
@@ -419,110 +468,122 @@ def executar_malha_3_desempenho(caminho_codigo, binario_saida="./bin_nativo"):
     Retorna um dict com:
         status               → "sucesso" | "nao_aplicavel" | "dados_insuficientes" | "erro_compilacao"
         complexidade_inferida→ string Big-O (ex: "O(N²)") ou "N/A"
-        metrica_usada        → "perf_stat" | "wall_time_ns (fallback)" | None
+        metrica_usada        → "callgrind (Ir aluno)" | "wall_time_ns (fallback)" | None
         dados_coletados      → {N: métrica} — pontos usados na regressão
         detalhes             → mensagem explicativa para log e debug
     """
 
-    # ── FASE 1: Compilação nativa sem instrumentação ──────────────────────────
-    # -O0 desativa otimizações do compilador para medir o algoritmo do aluno,
-    # não a versão otimizada que mascararia a complexidade real (ex: loop eliminado pelo GCC).
-    # -g mantém símbolos de debug mínimos para rastreabilidade em caso de crash.
-    compilacao = subprocess.run(
-        ["gcc", "-O0", "-g", "-o", binario_saida, caminho_codigo],
-        capture_output=True, text=True
-    )
-    if compilacao.returncode != 0:
-        # Retorna o erro do compilador diretamente — sem código compilado, não há o que medir
+    # Cria diretório no /tmp (que no WSL é resolvido via tmpfs ou sistema nativo).
+    # Isso impede que o Callgrind perca inodes e deixe objetos com nome em branco (atrito NTFS).
+    temp_dir = tempfile.mkdtemp(prefix="malha3_")
+    binario_saida = os.path.join(temp_dir, "bin_nativo")
+
+    try:
+        # ── FASE 1: Compilação nativa sem instrumentação ──────────────────────────
+        # -O0 desativa otimizações do compilador para medir o algoritmo do aluno,
+        # não a versão otimizada que mascararia a complexidade real (ex: loop eliminado pelo GCC).
+        # -g mantém símbolos de debug mínimos para rastreabilidade em caso de crash.
+        compilacao = subprocess.run(
+            ["gcc", "-O0", "-g", "-o", binario_saida, caminho_codigo],
+            capture_output=True, text=True
+        )
+        if compilacao.returncode != 0:
+            # Retorna o erro do compilador diretamente — sem código compilado, não há o que medir
+            return {
+                "status": "erro_compilacao",
+                "complexidade_inferida": "N/A",
+                "metrica_usada": None,
+                "dados_coletados": {},
+                "detalhes": compilacao.stderr.strip()
+            }
+
+        # ── FASE 2: Detecção do cenário de entrada ────────────────────────────────
+        with open(caminho_codigo, 'r', encoding='utf-8', errors='replace') as f:
+            codigo_fonte = f.read()
+
+        # Analisa o código-fonte para encontrar uma variável de escala controlável
+        var_escala = detectar_parametro_escala(codigo_fonte)
+
+        # ── CENÁRIO B: Entrada fixa — análise não aplicável ───────────────────────
+        if var_escala is None:
+            return {
+                "status": "nao_aplicavel",
+                "complexidade_inferida": "N/A — Exercício de Entrada Fixa",
+                "metrica_usada": None,
+                "dados_coletados": {},
+                "detalhes": (
+                    "Nenhum parâmetro de tamanho escalável detectado no código. "
+                    "Heurística: busca por `scanf(\"%d\", &var)` seguido de loop ou "
+                    "alocação de tamanho `var`. "
+                    "Exercícios de entrada fixa não permitem inferência de complexidade "
+                    "assintótica via escalagem de N. "
+                    "Alternativa futura: o professor anota a variável de escala no "
+                    "cadastro do exercício na plataforma."
+                )
+            }
+
+        # ── CENÁRIO A: Entrada escalável — executa o perfilamento ─────────────────
+        # _checar_callgrind() verifica UMA VEZ se o Valgrind está instalado e cacheia
+        # o resultado. O Callgrind conta instruções por emulação (sem PMU) e por objeto,
+        # o que permite somar só o binário do aluno e isolar o algoritmo do I/O.
+        callgrind_ok = _checar_callgrind()
+
+        # Seleciona a escala de N adequada para a estratégia de medição disponível
+        escala_ativa = TAMANHOS_ESCALA_INSTRUCOES if callgrind_ok else TAMANHOS_ESCALA_TIME
+        estrategia = "callgrind (instruções do aluno)" if callgrind_ok else "wall_time_ns (fallback — Callgrind indisponível)"
+
+        print(f"  -> [Malha 3] Parâmetro de escala: '{var_escala}' | Escala: {escala_ativa}")
+
+        dados_coletados = {}  # acumula {N: métrica} para cada tamanho testado
+        metrica_fonte = None  # registra qual método foi usado ("callgrind (Ir aluno)" ou "wall_time_ns")
+
+        for N in escala_ativa:
+            entrada_stdin = gerar_entrada_para_n(N)        # gera o stdin com N elementos
+            valor, fonte = coletar_metrica(binario_saida, entrada_stdin)  # mede o custo
+
+            if valor is not None:
+                dados_coletados[N] = valor       # ponto válido — adiciona ao conjunto de dados
+                if metrica_fonte is None:
+                    metrica_fonte = fonte        # registra a fonte apenas na primeira medição válida
+
+                unidade = "instr." if "callgrind" in (fonte or "") else "ns"
+                print(f"     N={N:>7,}: {valor:>16,} {unidade}")
+            else:
+                # Ponto descartado: abaixo do limiar de ruído ou timeout
+                print(f"     N={N:>7,}: abaixo do limiar de ruído ou timeout")
+
+        # ── FASE 3: Verifica se há pontos suficientes para a regressão ────────────
+        if len(dados_coletados) < 3:
+            return {
+                "status": "dados_insuficientes",
+                "complexidade_inferida": "Indeterminada",
+                "metrica_usada": metrica_fonte,
+                "dados_coletados": dados_coletados,
+                "detalhes": (
+                    f"Apenas {len(dados_coletados)} de {len(escala_ativa)} pontos coletados "
+                    "com sinal acima do limiar. Regressão requer mínimo de 3. "
+                    f"Estratégia usada: {estrategia}. "
+                    "Verifique se o Valgrind está instalado ou o timeout dos algoritmos "
+                    "(a emulação do Callgrind é lenta para N grande)."
+                )
+            }
+
+        # ── FASE 4: Regressão estatística — infere a curva Big-O ─────────────────
+        # Passa os pontos coletados para a regressão que testa cada família de complexidade
+        complexidade = inferir_big_o(dados_coletados, list(dados_coletados.keys()))
+        print(f"  -> [Malha 3] Complexidade inferida: {complexidade}")
+
         return {
-            "status": "erro_compilacao",
-            "complexidade_inferida": "N/A",
-            "metrica_usada": None,
-            "dados_coletados": {},
-            "detalhes": compilacao.stderr.strip()
-        }
-
-    # ── FASE 2: Detecção do cenário de entrada ────────────────────────────────
-    with open(caminho_codigo, 'r', encoding='utf-8', errors='replace') as f:
-        codigo_fonte = f.read()
-
-    # Analisa o código-fonte para encontrar uma variável de escala controlável
-    var_escala = detectar_parametro_escala(codigo_fonte)
-
-    # ── CENÁRIO B: Entrada fixa — análise não aplicável ───────────────────────
-    if var_escala is None:
-        return {
-            "status": "nao_aplicavel",
-            "complexidade_inferida": "N/A — Exercício de Entrada Fixa",
-            "metrica_usada": None,
-            "dados_coletados": {},
-            "detalhes": (
-                "Nenhum parâmetro de tamanho escalável detectado no código. "
-                "Heurística: busca por `scanf(\"%d\", &var)` seguido de loop ou "
-                "alocação de tamanho `var`. "
-                "Exercícios de entrada fixa não permitem inferência de complexidade "
-                "assintótica via escalagem de N. "
-                "Alternativa futura: o professor anota a variável de escala no "
-                "cadastro do exercício na plataforma."
-            )
-        }
-
-    # ── CENÁRIO A: Entrada escalável — executa o perfilamento ─────────────────
-    # _checar_perf() faz um pre-check de 3s UMA VEZ e cacheia o resultado.
-    # Isso evita o travamento de 30s×8 que ocorria em WSL sem PMU disponível.
-    perf_ok = _checar_perf()
-
-    # Seleciona a escala de N adequada para a estratégia de medição disponível
-    escala_ativa = TAMANHOS_ESCALA_PERF if perf_ok else TAMANHOS_ESCALA_TIME
-    estrategia = "perf stat (HPC)" if perf_ok else "wall_time_ns (fallback — perf indisponível)"
-
-    print(f"  -> [Malha 3] Parâmetro de escala: '{var_escala}' | Escala: {escala_ativa}")
-
-    dados_coletados = {}  # acumula {N: métrica} para cada tamanho testado
-    metrica_fonte = None  # registra qual método foi usado ("perf_stat" ou "wall_time_ns")
-
-    for N in escala_ativa:
-        entrada_stdin = gerar_entrada_para_n(N)        # gera o stdin com N elementos
-        valor, fonte = coletar_metrica(binario_saida, entrada_stdin)  # mede o custo
-
-        if valor is not None:
-            dados_coletados[N] = valor       # ponto válido — adiciona ao conjunto de dados
-            if metrica_fonte is None:
-                metrica_fonte = fonte        # registra a fonte apenas na primeira medição válida
-
-            unidade = "instr." if "perf" in (fonte or "") else "ns"
-            print(f"     N={N:>7,}: {valor:>16,} {unidade}")
-        else:
-            # Ponto descartado: abaixo do limiar de ruído ou timeout
-            print(f"     N={N:>7,}: abaixo do limiar de ruído ou timeout")
-
-    # ── FASE 3: Verifica se há pontos suficientes para a regressão ────────────
-    if len(dados_coletados) < 3:
-        return {
-            "status": "dados_insuficientes",
-            "complexidade_inferida": "Indeterminada",
+            "status": "sucesso",
+            "complexidade_inferida": complexidade,
             "metrica_usada": metrica_fonte,
             "dados_coletados": dados_coletados,
             "detalhes": (
-                f"Apenas {len(dados_coletados)} de {len(escala_ativa)} pontos coletados "
-                "com sinal acima do limiar. Regressão requer mínimo de 3. "
-                f"Estratégia usada: {estrategia}. "
-                "Verifique perf_event_paranoid no servidor ou timeout dos algoritmos."
+                f"Regressão sobre {len(dados_coletados)} pontos via '{metrica_fonte}'. "
+                f"Tamanhos testados: {list(dados_coletados.keys())}"
             )
         }
 
-    # ── FASE 4: Regressão estatística — infere a curva Big-O ─────────────────
-    # Passa os pontos coletados para a regressão que testa cada família de complexidade
-    complexidade = inferir_big_o(dados_coletados, list(dados_coletados.keys()))
-    print(f"  -> [Malha 3] Complexidade inferida: {complexidade}")
-
-    return {
-        "status": "sucesso",
-        "complexidade_inferida": complexidade,
-        "metrica_usada": metrica_fonte,
-        "dados_coletados": dados_coletados,
-        "detalhes": (
-            f"Regressão sobre {len(dados_coletados)} pontos via '{metrica_fonte}'. "
-            f"Tamanhos testados: {list(dados_coletados.keys())}"
-        )
-    }
+    finally:
+        # Garante a remoção do diretório temporário do binário nativo para não entulhar o /tmp
+        shutil.rmtree(temp_dir, ignore_errors=True)

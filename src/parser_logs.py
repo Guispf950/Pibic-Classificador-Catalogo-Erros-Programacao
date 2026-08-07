@@ -11,6 +11,25 @@ def limpar_log_gdb(log_bruto, nome_arquivo):
     # Lista que vai acumular apenas as linhas consideradas relevantes
     log_limpo = []
 
+    # Marcadores de RUÍDO DE SISTEMA: frames e variáveis da libc / do carregador
+    # dinâmico (ld.so) / da glibc. NÃO são código do aluno. Quando o GDB tira um
+    # backtrace fora do código do aluno (ex.: durante a inicialização, ou nas camadas
+    # abaixo do main), ele despeja DEZENAS dessas linhas — foi o que inflou o log para
+    # 200+ linhas inúteis. Qualquer linha que contenha um destes marcadores é descartada.
+
+    #Isso deve ser refinado nas proximas versões. 
+    RUIDO_SISTEMA = (
+        "/usr/", "sysdeps", "/elf/", "dl-load", "dl-map", "dl-deps", "dl-catch",
+        "dl-open", "dl-init", "libc-start", "libc.so", "ld-linux", "/nptl/", "/csu/",
+        "<optimized out>", "__PRETTY_FUNCTION__", ".S:", "debuginfod", "auto-load",
+        "valgrind-monitor", "(below main)", "__libc_", "_dl_",
+    )
+
+    # Estado: estamos atualmente DENTRO de um frame do código do aluno?
+    # As variáveis locais ("var = valor") só interessam quando pertencem a uma função
+    # do aluno. Sem esse controle, os locais dos frames da libc entrariam no log.
+    frame_do_aluno = False
+
     for linha in linhas:
         # Remove espaços e tabulações das bordas da linha para simplificar as comparações
         linha_strip = linha.strip()
@@ -28,6 +47,21 @@ def limpar_log_gdb(log_bruto, nome_arquivo):
         # internos do GDB (registradores, memória bruta). São ilegíveis para o aluno
         # e irrelevantes para o diagnóstico. Pulamos sem adicionar ao log limpo.
         if len(linha_strip) > 300:
+            continue
+
+        # --- FILTRO 2.5: FRONTEIRA DE FRAME (#0, #1, ...) ---
+        # Toda vez que o backtrace troca de frame, decidimos se é do aluno ou do sistema.
+        # Isso é feito ANTES do filtro de ruído para que a fronteira SEMPRE seja atualizada
+        # (mesmo que o frame seja da libc), mantendo o estado 'frame_do_aluno' correto.
+        if len(linha_strip) >= 2 and linha_strip[0] == "#" and linha_strip[1].isdigit():
+            frame_do_aluno = nome_arquivo in linha_strip
+            if frame_do_aluno:
+                log_limpo.append(linha_strip)   # mantém só os frames do código do aluno
+            continue
+
+        # --- FILTRO 2.6: RUÍDO DE SISTEMA — PULA A LINHA ---
+        # Linhas de libc/ld.so (frames "at ./elf/...", locais "<optimized out>", etc.).
+        if any(marcador in linha_strip for marcador in RUIDO_SISTEMA):
             continue
 
         # --- FILTRO 3: ALERTAS CRÍTICOS ---
@@ -49,6 +83,18 @@ def limpar_log_gdb(log_bruto, nome_arquivo):
             "Invalid",              # leitura/escrita/free inválidos (Invalid read, Invalid write, Invalid free)
             "Mismatched free",      # new[] liberado com delete (ou vice-versa)
             "Uninitialized",        # uso de valor de memória não inicializada
+            "uninitialised",        # variação britânica do anterior (minúscula, meio de frase)
+            "use-after-scope",      # ASan: uso de variável local após sair do escopo
+
+            # --- ORIGEM / CAUSA RAIZ (linhas geradas pelas novas flags) ---
+            # Estas linhas NÃO dizem o sintoma; dizem ONDE o erro NASCEU. Preservá-las é
+            # o que permite separar "linha do sintoma" de "linha da causa raiz".
+            "Uninitialised",        # Valgrind --track-origins: "Uninitialised value was created by..."
+            "was created by",       # rótulo da origem do valor não inicializado (stack/heap)
+            "Block was alloc'd",    # Valgrind --keep-stacktraces: onde o bloco liberado foi ALOCADO
+            "a block of size",      # Valgrind: "Address 0x.. is N bytes inside a block of size M free'd"
+            "declared at",          # Valgrind --read-var-info: nome da variável e linha de declaração
+            "is located",           # ASan: "0x.. is located N bytes inside of.. region" / var na stack
         ]
 
         if any(alerta in linha_strip for alerta in ALERTAS_CRITICOS):
@@ -78,22 +124,27 @@ def limpar_log_gdb(log_bruto, nome_arquivo):
         # mostram exatamente onde no código-fonte o erro ocorreu.
         # Descartamos frames de bibliotecas do sistema (libc, libasan etc.).
         elif nome_arquivo in linha_strip:
+            frame_do_aluno = True   # a partir daqui, os locais pertencem ao aluno
             log_limpo.append(linha_strip)
 
-        # --- FILTRO 6: VARIÁVEIS LOCAIS (ANTI-RUÍDO DE SISTEMA) ---
-        # O comando "info locals" do GDB gera linhas no formato "variavel = valor".
-        # Precisamos excluir:
+        # --- FILTRO 6: VARIÁVEIS LOCAIS (SÓ DENTRO DE FRAME DO ALUNO) ---
+        # O comando "info locals"/"bt full" do GDB gera linhas "variavel = valor".
+        # Só interessam as do CÓDIGO DO ALUNO — por isso exigimos 'frame_do_aluno'.
+        # Sem esse gate, os locais dos frames da libc (dezenas por frame) entrariam
+        # no log. Também excluímos:
         # - Linhas começando com "==" → prefixo de metadados do Valgrind/ASan
         # - Linhas começando com " " → continuações de valores multilinhas do GDB
         # - Linhas começando com "__" → variáveis internas geradas pelo compilador
-        #   (ex: __PRETTY_FUNCTION__, __func__) que não fazem parte do código do aluno
-        elif "=" in linha_strip and not linha_strip.startswith("==") and not linha_strip.startswith(" "):
-            if not linha_strip.startswith("__"):  # ignora símbolos internos do compilador
-                log_limpo.append(linha_strip)
+        elif (
+            frame_do_aluno
+            and "=" in linha_strip
+            and not linha_strip.startswith("==")
+            and not linha_strip.startswith(" ")
+            and not linha_strip.startswith("__")
+        ):
+            log_limpo.append(linha_strip)
 
-    # Imprime métricas do filtro para rastreabilidade durante desenvolvimento/debug
-    print(f"  -> Log bruto de {len(linhas)} linhas filtrado estruturalmente para {len(log_limpo)} linhas relevantes.\n")
-    print("  -> Log Limpo:\n" + "\n".join(log_limpo) + "\n")
+    
 
     # Reconstrói o log filtrado como string única separada por quebras de linha
     return '\n'.join(log_limpo)

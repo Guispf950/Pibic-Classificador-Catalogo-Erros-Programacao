@@ -1,16 +1,31 @@
 """
-Detecção de parâmetro de escala e geração de stdin automático.
+Detecção de parâmetro de escala e geração de stdin para as malhas de memória.
 
 Este módulo é COMPARTILHADO pela Malha 1 (ASan+GDB) e pela Malha 2 (Valgrind+vgdb).
-Seu objetivo é evitar que programas que leem dados via scanf travem os subprocessos
-de análise (GDB/Valgrind) aguardando input do terminal.
+Seu objetivo é fornecer o stdin que exercita o código durante a análise de memória,
+evitando que os subprocessos (GDB/Valgrind) travem aguardando input do terminal.
 
-Historicamente essas funções viviam dentro do perfilador de desempenho (Malha 3).
-Com a remoção da Malha 3 do pipeline, elas foram extraídas para cá — são a única
-parte daquele módulo de que as malhas de memória ainda dependem.
+Fonte de entrada, em ordem de prioridade:
+  1. Caso de teste REAL por arquivo (<nome>.in ao lado do <nome>.c).
+  2. Caso de teste REAL compartilhado pela pasta (_entrada.in no mesmo diretório) —
+     útil quando a pasta contém várias submissões do MESMO exercício (que, por serem
+     o mesmo problema, compartilham exatamente a mesma entrada).
+  3. Heurística de escala (fallback): reconhece scanf("%d", &var) e sintetiza uma
+     entrada mínima.
+  4. Nenhuma: entrada fixa não reconhecida — herda o stdin do ambiente.
+
+O texto do .in é a entrada REAL do exercício (o mesmo que o CodeBench já armazena por
+questão), o que elimina a adivinhação do stdin e cobre qualquer formato de entrada.
 """
 
+import os
 import re
+
+
+# Nome convencional do arquivo de entrada COMPARTILHADO por uma pasta de submissões
+# do mesmo exercício. Quando não há um <nome>.in específico, este é usado por todos
+# os .c do diretório.
+NOME_ENTRADA_COMPARTILHADA = "_entrada.in"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -72,7 +87,7 @@ def detectar_parametro_escala(codigo_fonte):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GERAÇÃO DE ENTRADA
+# GERAÇÃO DE ENTRADA (fallback heurístico)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def gerar_entrada_para_n(N, formato="N_ESPACO_VALORES"):
@@ -103,36 +118,103 @@ def gerar_entrada_para_n(N, formato="N_ESPACO_VALORES"):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STDIN AUTOMÁTICO PARA AS MALHAS DE MEMÓRIA
+# CASO DE TESTE REAL (arquivo .in)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def caminho_caso_de_teste(caminho_codigo):
+    """
+    Devolve o caminho do arquivo de entrada real (.in) associado ao .c, ou None.
+
+    Procura em duas convenções, nesta ordem:
+      1. POR ARQUIVO — mesmo nome-base do .c, no mesmo diretório:
+            data/teste_avl.c  ->  data/teste_avl.in
+      2. COMPARTILHADO POR PASTA — um único "_entrada.in" no mesmo diretório, usado
+         por TODOS os .c da pasta:
+            .../submissoes/submissao_1.c ─┐
+            .../submissoes/submissao_2.c ─┼─►  .../submissoes/_entrada.in
+            .../submissoes/submissao_3.c ─┘
+         Ideal para pastas que contêm várias submissões do MESMO exercício: como o
+         problema é o mesmo, a entrada é a mesma — evita duplicar um .in por arquivo.
+
+    O .in por arquivo tem prioridade sobre o compartilhado (permite exceções pontuais).
+    """
+    # 1) por arquivo: <nome>.in
+    caminho_in = os.path.splitext(caminho_codigo)[0] + ".in"
+    if os.path.isfile(caminho_in):
+        return caminho_in
+
+    # 2) compartilhado por pasta: _entrada.in no mesmo diretório
+    pasta = os.path.dirname(os.path.abspath(caminho_codigo))
+    compartilhado = os.path.join(pasta, NOME_ENTRADA_COMPARTILHADA)
+    if os.path.isfile(compartilhado):
+        return compartilhado
+
+    return None
+
+
+def _ler_caso_de_teste(caminho_codigo):
+    """
+    Lê o conteúdo do .in associado (por arquivo ou compartilhado) e o retorna como
+    string. Retorna None quando não há caso de teste cadastrado ou o arquivo é vazio.
+    """
+    caminho_in = caminho_caso_de_teste(caminho_codigo)
+    if caminho_in is None:
+        return None
+    try:
+        with open(caminho_in, 'r', encoding='utf-8', errors='replace') as f:
+            conteudo = f.read()
+    except Exception:
+        return None
+
+    # .in vazio/whitespace não serve como entrada — trata como ausente
+    if conteudo.strip() == "":
+        return None
+
+    # Garante uma quebra de linha final (o scanf espera terminadores previsíveis)
+    if not conteudo.endswith("\n"):
+        conteudo = conteudo + "\n"
+
+    return conteudo
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STDIN PARA AS MALHAS DE MEMÓRIA
 # ══════════════════════════════════════════════════════════════════════════════
 
 def stdin_para_analise(caminho_codigo):
     """
-    Gera um stdin mínimo para exercitar o código durante a análise de memória
-    (Malha 1 e 2), evitando que o processo trave aguardando input do terminal.
+    Escolhe o stdin que exercita o código durante a análise de memória (Malha 1 e 2),
+    evitando que o processo trave aguardando input do terminal.
 
-    Lógica:
-        Se o código lê um inteiro N via scanf e o usa como tamanho de array/laço,
-        gera a string "5\\n1 2 3 4 5\\n" — suficiente para exercitar o algoritmo
-        (malloc/free, acessos a vetor) sem sobrecarregar a análise.
+    ORDEM DE PRIORIDADE:
+      1. CASO DE TESTE REAL (.in por arquivo ou _entrada.in da pasta): usa o texto real
+         do exercício (o que o CodeBench já cadastra). Fonte preferida.
+      2. HEURÍSTICA (fallback): sem .in, tenta detectar um parâmetro de escala
+         (scanf("%d", &var) com um único %d) e sintetiza "5\\n1 2 3 4 5\\n".
+      3. NENHUMA: entrada fixa não reconhecida → None (o processo herda o stdin do ambiente).
 
-        Se o código não tem parâmetro de escala (entrada fixa, ex: "some 3 números"),
-        retorna None → o processo herda o stdin do terminal normalmente.
-
-    Por que N=5 e não N=100?
-        As malhas 1/2 testam CORREÇÃO de memória, não desempenho. N=5 já exercita
-        malloc/free e detecta buffer overflow sem aumentar o tempo do Valgrind.
-
-    Limitações conhecidas (assumidas):
-        - Cobre apenas o padrão scanf("%d", &var) com um único %d controlando escala.
-        - Entradas compostas (ex: "%d %d") ou formatos não-canônicos não são cobertos;
-          nesses casos retorna None e o processo herda o stdin do ambiente.
+    Por que o .in vem primeiro?
+        A adivinhação por regex é frágil (só pega o padrão canônico). O ".in" real
+        elimina a adivinhação: cobre listas, matrizes e formatos
+        compostos que a heurística nunca cobriria — antecipando a integração com os
+        casos de teste que o CodeBench já armazena por questão.
     """
+    # 1) Caso de teste real (.in por arquivo ou compartilhado da pasta) — fonte preferida
+    caso = _ler_caso_de_teste(caminho_codigo)
+    if caso is not None:
+        nome_in = os.path.basename(caminho_caso_de_teste(caminho_codigo))
+        print(f"  -> [entrada] usando caso de teste real: {nome_in}")
+        return caso
+
+    # 2) Heurística de escala (fallback), só quando não há .in cadastrado
     try:
         with open(caminho_codigo, 'r', encoding='utf-8', errors='replace') as f:
             codigo = f.read()
         if detectar_parametro_escala(codigo):
+            print("  -> [entrada] sem .in; usando heurística de escala (N=5)")
             return gerar_entrada_para_n(5)   # "5\n1 2 3 4 5\n"
     except Exception:
         pass
-    return None  # sem stdin automático — herda do ambiente
+
+    # 3) Sem entrada automática — herda do ambiente
+    return None
