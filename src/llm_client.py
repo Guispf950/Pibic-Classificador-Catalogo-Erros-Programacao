@@ -6,23 +6,33 @@ import time      # Para backoff entre tentativas de retry
 
 # Configuração central: endereço/modelo/temperatura do LLM e o modo de anotação
 # (a variável dos experimentos de ablação). Ver src/config.py.
-from src.config import URL_LLM_LOCAL, NOME_MODELO, TEMPERATURA_LLM, MODO_ANOTACAO
+from src.config import (
+    URL_LLM_LOCAL, NOME_MODELO, MODO_ANOTACAO,
+    TEMPERATURA_CLASSIFICACAO, TEMPERATURA_FEEDBACK,
+)
 
 # Classificação DETERMINÍSTICA do erro para CWE (a partir do log da ferramenta).
-from src.cwe import classificar_cwe
+from src.cwe import classificar_cwe, classificar_cwe_tipo
+
+# Base de Conhecimento: recupera, por CHAVE EXATA (o CWE), o documento curado do erro.
+# Usado na 2ª chamada ao LLM (geração de feedback) para aterrar a explicação.
+from src.kb import recuperar_kb
 
 
-def _chamar_llm(prompt, tentativa=1):
+def _chamar_llm(prompt, tentativa=1, temperatura=TEMPERATURA_CLASSIFICACAO):
     """
     Executa uma chamada ao Ollama e retorna o texto completo gerado.
     Retorna string vazia se o servidor não gerar nenhum token.
+
+    'temperatura' é passada por CADA FASE: a classificação usa 0.0 (determinística) e o
+    feedback usa uma um pouco mais alta (texto mais natural). O default é o da classificação.
     """
     resposta = requests.post(URL_LLM_LOCAL, json={
         "model": NOME_MODELO,
         "prompt": prompt,
         "stream": True,
         "format": "json",
-        "options": {"temperature": TEMPERATURA_LLM}   # vem do config central
+        "options": {"temperature": temperatura}   # definida pela fase que chamou
     }, stream=True, timeout=120)
 
     texto_completo = ""
@@ -326,156 +336,265 @@ def _evidencia_do_log(log):
 # ══════════════════════════════════════════════════════════════════════════════
 # CLASSIFICAÇÃO FORENSE (com anotação inline)
 # ════════════════════════════
-def classificar_erro(log_limpo, codigo_fonte="", nome_arquivo="", log_bruto="", max_tentativas=3):
+def classificar_erro(log_limpo, codigo_fonte="", nome_arquivo="", log_bruto=""):
     """
-    Anota o código-fonte com os pontos que a ferramenta reportou (inline, // @@) e
-    envia esse CÓDIGO ANOTADO para o LLM local, que EXPLICA e CLASSIFICA o erro.
+    CLASSIFICAÇÃO 100% DETERMINÍSTICA do erro — SEM LLM.
 
-    Diferença central em relação à versão anterior: a LLM NÃO recebe mais números de
-    linha em texto (veneno para o modelo, per FLAME) nem precisa devolvê-los — a
-    localização já está marcada no código e é preenchida deterministicamente no resultado.
+    Antes esta função chamava o LLM para preencher tipo_erro/variaveis/causa_raiz/
+    descricao_curta. Agora TODOS os campos retornados vêm da FERRAMENTA (ASan/Valgrind),
+    por regex/parsing — rápido, estável e auditável. Assim o /analisar devolve um
+    diagnóstico IMEDIATO. Os campos que só a LLM produzia (causa_raiz, descricao_curta,
+    variaveis_envolvidas) FORAM REMOVIDOS daqui: quando o aluno quiser detalhe, é o passo
+    de FEEDBACK (gerar_feedback / gerar_feedback_stream) que usa o LLM.
 
-    Retorna um dict com a classificação (campos da IA + linhas determinísticas).
+    Retorna um dict determinístico:
+        tipo_erro, cwe_id, cwe_nome, linha_sintoma, linha_causa, linha_ocorrencia,
+        evidencia_log, codigo_anotado
     """
-    # 1) Extrai os pontos da ferramenta e monta o código anotado (determinístico).
+    # 1) Pontos da ferramenta + código anotado inline (// @@) — determinístico.
     #    Prefere o log BRUTO (todas as seções presentes) e cai no limpo se não vier.
     pontos = _extrair_pontos_anotacao(log_bruto or log_limpo, nome_arquivo)
-    # Refina a CAUSA de valor não inicializado: da abertura da função (o que o Valgrind
-    # dá) para a DECLARAÇÃO da variável, quando ela é inequívoca. Determinístico, no fonte.
+    # Refina a CAUSA de valor não inicializado (da abertura da função para a DECLARAÇÃO
+    # da variável, quando inequívoca). Determinístico, sobre o fonte.
     pontos = _refinar_causa_uninit(pontos, codigo_fonte)
     codigo_anotado = _anotar_codigo(codigo_fonte, pontos)
 
-    # Linhas determinísticas (vêm da ferramenta, não da LLM):
+    # 2) Linhas determinísticas (vêm da ferramenta, não da LLM).
     linha_sintoma = str(pontos["SINTOMA"][0]) if "SINTOMA" in pontos else (
         str(pontos["VAZAMENTO"][0]) if "VAZAMENTO" in pontos else "-")
     linha_causa = str(pontos["CAUSA"][0]) if "CAUSA" in pontos else "-"
 
-    # CWE DETERMINÍSTICO — vem do log da FERRAMENTA (não do LLM). Serve de rótulo padrão
-    # e de checagem de consistência contra o `tipo_erro` que o modelo devolver.
-    cwe_id, cwe_nome = classificar_cwe(log_bruto or log_limpo)
+    # 3) CWE + nome + tipo_erro — todos determinísticos, da assinatura do log da ferramenta.
+    cwe_id, cwe_nome, tipo_erro = classificar_cwe_tipo(log_bruto or log_limpo)
 
-    # 2) Monta o prompt conforme o MODO de anotação (ablação estilo FLAME).
-    #    O que MUDA entre os modos é SÓ como a localização do erro chega à LLM; o resto
-    #    (veredito, esquema JSON, regras 1–3) é idêntico, para isolar essa variável.
-    print(f"  -> [modo anotação] {MODO_ANOTACAO}")
-    if MODO_ANOTACAO == "inline":
-        intro = (
-            "O CÓDIGO abaixo já foi ANOTADO deterministicamente pela ferramenta (ASan/Valgrind).\n"
-            "Comentários `// @@` marcam os pontos: [SINTOMA] onde o erro se manifesta; "
-            "[CAUSA] onde ele nasce; [VAZAMENTO] a alocação vazada.\n"
-            "Confie nessas anotações: elas já marcam os pontos EXATOS."
-        )
+    # 4) Evidência: uma linha REAL do relatório (âncora anti-alucinação; determinística).
+    evidencia_log = _evidencia_do_log(log_bruto or log_limpo)
+
+    return {
+        "tipo_erro":       tipo_erro,
+        "cwe_id":          cwe_id,
+        "cwe_nome":        cwe_nome,
+        "linha_sintoma":   linha_sintoma,
+        "linha_causa":     linha_causa,
+        # Compatibilidade com quem lê "linha_ocorrencia" (= sintoma).
+        "linha_ocorrencia": linha_sintoma,
+        "evidencia_log":   evidencia_log,
+        # Código com as anotações inline (// @@), para o orquestrador salvar / o feedback usar.
+        "codigo_anotado":  codigo_anotado,
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2ª CHAMADA AO LLM — GERAÇÃO DE FEEDBACK PEDAGÓGICO FORMATIVO
+# ══════════════════════════════════════════════════════════════════════════════
+
+def montar_prompt_feedback(codigo, analise, saida="json"):
+    """
+    Monta o PROMPT do feedback formativo — FONTE ÚNICA das regras pedagógicas.
+
+    É usada em DOIS caminhos, para as regras nunca divergirem:
+      • gerar_feedback (offline/catálogo): saida="json" -> pede um JSON {"feedback": ...},
+        que é validado/retentado (comportamento original, inalterado).
+      • gerar_feedback_stream (API/SSE):   saida="texto" -> pede TEXTO puro, para os
+        tokens do Ollama irem direto ao aluno, sem envelope JSON no meio do stream.
+
+    Só a INSTRUÇÃO FINAL muda entre os dois; o corpo (regras + exemplos + diagnóstico)
+    é idêntico.
+    """
+    # Recupera o documento curado do erro por CHAVE EXATA (o CWE já apurado na 1ª fase).
+    # Sem documento para esse CWE, doc_kb = "" e o prompt segue sem ele (degradação graciosa).
+    cwe_id = analise.get("cwe_id", "-")
+    doc_kb = recuperar_kb(cwe_id)
+
+    # Campos da classificação que dão CONTEXTO ao feedback (todos DETERMINÍSTICOS agora).
+    tipo_erro     = analise.get("tipo_erro", "-")
+    cwe_nome      = analise.get("cwe_nome", "-")
+    linha_sintoma = analise.get("linha_sintoma", "-")
+    linha_causa   = analise.get("linha_causa", "-")
+
+    # A seção da KB só entra no prompt se houver documento (evita cabeçalho vazio).
+    secao_kb = f"\n===== MATERIAL DE APOIO (sobre este tipo de erro) =====\n{doc_kb}\n" if doc_kb else ""
+
+    # ── ABLAÇÃO (MODO_ANOTACAO) — antes vivia na classificação (via LLM); agora que a
+    #    classificação é determinística, a ablação passa a viver AQUI, no ÚNICO passo que
+    #    ainda usa LLM. Controla COMO a localização do erro chega ao modelo (variável
+    #    experimental estilo FLAME):
+    #      inline   -> código com marcadores // @@ (localização embutida no código)
+    #      numerica -> código original + as linhas do erro em TEXTO (o "FLAME_num")
+    #      nenhuma  -> código original, sem nenhuma dica de linha (baseline)
+    #    OBS: 'codigo' recebido deve ser o ORIGINAL; o anotado vem de analise["codigo_anotado"].
+    codigo_anotado = analise.get("codigo_anotado", "") or codigo
+    if MODO_ANOTACAO == "numerica":
+        cabecalho_codigo = "===== CÓDIGO DO ALUNO ====="
+        corpo_codigo = codigo
+        dica_linhas = f"\nA ferramenta localizou o erro nestas linhas — sintoma: {linha_sintoma}; causa: {linha_causa}.\n"
+    elif MODO_ANOTACAO == "nenhuma":
+        cabecalho_codigo = "===== CÓDIGO DO ALUNO ====="
+        corpo_codigo = codigo
+        dica_linhas = ""
+    else:  # "inline" (padrão)
         cabecalho_codigo = "===== CÓDIGO DO ALUNO (JÁ ANOTADO PELA FERRAMENTA) ====="
         corpo_codigo = codigo_anotado
-        regra_extra = ('4. As anotações `// @@` são RÓTULOS nossos. NÃO as use como evidência: o campo\n'
-                       '   "evidencia_log" deve conter uma linha REAL do VEREDITO abaixo.\n')
-    elif MODO_ANOTACAO == "numerica":
-        _dicas = []
-        if linha_sintoma != "-":
-            _dicas.append(f"SINTOMA na linha {linha_sintoma}")
-        if linha_causa != "-":
-            _dicas.append(f"CAUSA na linha {linha_causa}")
-        _dica_txt = "; ".join(_dicas) if _dicas else "linha não fornecida"
-        intro = (
-            "O CÓDIGO abaixo é o do aluno (SEM anotações). A ferramenta (ASan/Valgrind) LOCALIZOU o\n"
-            f"erro nestas linhas: {_dica_txt}. Use esses NÚMEROS para achar o ponto no código."
-        )
-        cabecalho_codigo = "===== CÓDIGO DO ALUNO ====="
-        corpo_codigo = codigo_fonte
-        regra_extra = ""
-    else:  # "nenhuma" (baseline)
-        intro = (
-            "O CÓDIGO abaixo é o do aluno. A ferramenta detectou um erro (veja o VEREDITO).\n"
-            "Identifique no código onde o erro ocorre e classifique-o."
-        )
-        cabecalho_codigo = "===== CÓDIGO DO ALUNO ====="
-        corpo_codigo = codigo_fonte
-        regra_extra = ""
+        dica_linhas = ""
 
-    secao_codigo = f"\n{cabecalho_codigo}\n```c\n{corpo_codigo}\n```\n" if corpo_codigo else ""
+    # --- CORPO DO PROMPT (idêntico nos dois caminhos) ---
+    corpo = f"""
+Você é um TUTOR de programação em C que dá FEEDBACK FORMATIVO a um ALUNO INICIANTE.
 
-    prompt = f"""
-Você é um analisador forense de erros em C.
+Um analisador já identificou o erro (seção DIAGNÓSTICO). Seu objetivo: fazer o aluno DESCOBRIR
+a correção sozinho, nunca recebê-la pronta. Termine SEMPRE o texto com uma PERGUNTA que leve o 
+aluno ao próximo passo, ou seja, uma pergunta que o faça pensar na correção, sem dizê-la.
 
-{intro}
+REGRAS:
+1. NÃO revele a correção, em código ou em palavras (ex.: não diga o que atribuir, o que trocar,
+   onde inserir uma chamada). Conduza o raciocínio até lá.
+2. Baseie-se SOMENTE no DIAGNÓSTICO. Cite a variável real e a(s) linha(s) reais informadas
+   ({linha_sintoma}, {linha_causa}), nunca invente outra causa.
+3. Texto corrido, 3 a 5 frases, linguagem simples. Sem código, sem markdown, sem listas.
+4. Termine SEMPRE o texto com uma PERGUNTA que leve o aluno ao próximo passo, uma pergunta que o faça
+   pensar na correção, sem dizê-la.
+5. Sua resposta é sobre O CASO ATUAL. Os exemplos abaixo são de OUTROS problemas, com outras
+   variáveis e outras linhas — servem só para mostrar o TOM. Não reaproveite nomes, números ou
+   frases deles. Se sua resposta usar as mesmas palavras de um exemplo, ela está errada.
 
-REGRAS (obrigatórias):
-1. Baseie-se APENAS no material fornecido (código + veredito); não invente erros não indicados.
-2. NÃO cite funções, variáveis ou linhas que não apareçam no material.
-3. Se algo não estiver claro, escreva "indeterminado" em vez de supor.
-{regra_extra}{secao_codigo}
-===== VEREDITO DA FERRAMENTA (apoio) =====
-{log_limpo}
-===== FIM DO VEREDITO =====
+EXEMPLOS DE ESTILO (problemas diferentes do caso atual — não copiar):
+Caso: variável usada sem inicialização.
+  Ruim (entrega a resposta): "Inicialize a variável 'total' antes do laço."
+  Bom (leva a pensar): "Note que 'total' é lida na linha 14 dentro do laço — antes disso, algum
+  caminho do código garante que ela já teve um valor definido?"
 
-Retorne APENAS um objeto JSON válido (sem markdown, sem texto fora do JSON):
-{{
-    "tipo_erro": "nome técnico (ex.: 'heap-use-after-free', 'use-after-scope', 'uninitialized-value', 'memory-leak', 'double-free', 'invalid-free', 'null-pointer-dereference')",
-    "variaveis_envolvidas": "variáveis citadas no material e seus valores, se houver (ex.: res=-132143025). Ponteiros como nome* (ex.: raiz*). Só o que aparece explicitamente.",
-    "causa_raiz": "explique POR QUE o erro ocorre (o encadeamento entre onde ele nasce e onde se manifesta)",
-    "descricao_curta": "1 frase explicando o erro de forma técnica e objetiva",
-    "evidencia_log": "cópia LITERAL de uma linha do VEREDITO DA FERRAMENTA (ex.: uma linha com '==NNNN==' ou '#N ... arquivo.c:linha'). NUNCA invente nem copie uma anotação // @@."
-}}
+EXEMPLOS DE ESTILO (problemas diferentes do caso atual — não copiar):
+Caso: acesso a índice fora dos limites de um vetor.
+  Ruim: "Troque o '<=' por '<' na condição do for."
+  Bom: "Seu vetor tem tamanho N e o laço vai até o índice N — o que existe na posição N de um
+  vetor de tamanho N?"
+
+EXEMPLOS DE ESTILO (problemas diferentes do caso atual — não copiar):
+Caso: vazamento de memória (bloco alocado que nunca é devolvido).
+  Ruim: "Adicione free(buffer) antes do return na linha 40."
+  Bom: "O bloco apontado por 'buffer' foi reservado na linha 22, mas o programa passa pelo
+  return da linha 40 sem mais nenhuma referência a ele — o que acontece com essa memória
+  a partir desse ponto, e quem mais consegue reaproveitá-la depois?"
+
+{cabecalho_codigo}
+```c
+{corpo_codigo}
+```
+{dica_linhas}
+===== DIAGNÓSTICO (fonte da localização) =====
+Tipo do erro: {tipo_erro} ({cwe_id} — {cwe_nome})
+Linha do sintoma: {linha_sintoma}
+Linha da causa: {linha_causa}
+Material de apoio: {secao_kb}
+
+Antes de responder, confira mentalmente: a pergunta ao final do feedback foi gerada? Sua pergunta menciona a variável e a linha REAIS do
+diagnóstico acima ? Se não, reescreva.
 """
 
-    ultimo_erro = None
+    # --- INSTRUÇÃO FINAL (único trecho que difere entre JSON e TEXTO) ---
+    if saida == "texto":
+        instrucao = (
+            "\nEscreva APENAS o texto do feedback ao aluno, em português, seguindo as regras "
+            "acima. Sem JSON, sem markdown, sem aspas ao redor, sem rótulos — apenas o parágrafo.\n"
+        )
+    else:  # "json" (padrão): comportamento original preservado
+        instrucao = (
+            "\nRetorne APENAS um JSON válido (sem markdown, sem texto fora dele):\n"
+            "{\n"
+            '    "feedback": "texto do feedback ao aluno, em português, seguindo as regras acima"\n'
+            "}\n"
+        )
 
+    return corpo + instrucao
+
+
+def gerar_feedback(codigo, analise, max_tentativas=3):
+    """
+    Gera o FEEDBACK FORMATIVO ao aluno (2ª chamada ao LLM, separada da classificação).
+
+    A 1ª chamada (classificar_erro) CLASSIFICA o erro; esta aqui CONVERSA com o aluno:
+    explica o erro e o guia a corrigir sozinho, SEM entregar a solução pronta.
+
+    Parâmetros (tudo vem PRONTO da 1ª fase — nada é recalculado):
+        codigo:  o código do aluno a exibir (idealmente o já anotado com // @@).
+        analise: o dict da classificação DETERMINÍSTICA (tipo_erro, cwe_id, linhas, codigo_anotado...).
+                 É o MESMO objeto que classificar_erro retornou (ou a linha lida da planilha).
+
+    Retorna: o dict {"feedback": "<texto>"} (ou um esqueleto de falha após os retries).
+    """
+    # O prompt vem do construtor único (regras pedagógicas centralizadas). saida="json"
+    # preserva o comportamento original: Ollama em format=json e leitura via json.loads.
+    prompt = montar_prompt_feedback(codigo, analise, saida="json")
+
+    ultimo_erro = None
     for tentativa in range(1, max_tentativas + 1):
         try:
-            texto_completo = _chamar_llm(prompt, tentativa)
-
-            # Resposta vazia: Ollama não gerou nenhum token (sobrecarga/timeout interno)
-            if not texto_completo.strip():
+            print(f"  -> [IA Feedback] (tentativa {tentativa}):")
+            # Feedback = temperatura um pouco mais alta (TEMPERATURA_FEEDBACK): texto mais
+            # natural/didático. O Ollama está em format=json, então a saída é SEMPRE um JSON
+            # válido (garantia da API) — daí a leitura abaixo não quebra.
+            texto = _chamar_llm(prompt, tentativa, temperatura=TEMPERATURA_FEEDBACK)
+            if not texto.strip():
                 raise ValueError("Ollama retornou resposta vazia (nenhum token gerado).")
 
-            resultado = json.loads(_sanitizar(texto_completo))
-
-            # 3) Injeta as linhas DETERMINÍSTICAS (da ferramenta), não confiando na LLM para isso.
-            resultado["linha_sintoma"] = linha_sintoma
-            resultado["linha_causa"] = linha_causa
-            # Compatibilidade com o catálogo existente (coluna "Linha" = sintoma).
-            resultado["linha_ocorrencia"] = linha_sintoma
-            # Código com as anotações inline (// @@), para o orquestrador salvar como arquivo.
-            resultado["codigo_anotado"] = codigo_anotado
-            # CWE determinístico (da ferramenta) — não confia na LLM para isso.
-            resultado["cwe_id"] = cwe_id
-            resultado["cwe_nome"] = cwe_nome
-
-            # SALVAGUARDA do 'evidencia_log': ele deve ser uma linha REAL do relatório, não o
-            # rótulo // @@ (que é padrão nosso). Se a LLM copiou a anotação, ou deixou vazio,
-            # substituímos deterministicamente por uma linha de verdade do log da ferramenta.
-            ev = str(resultado.get("evidencia_log", "")).strip()
-            if (not ev) or ev in ("-", "'-'") or "@@" in ev:
-                resultado["evidencia_log"] = _evidencia_do_log(log_bruto or log_limpo)
+            resultado = json.loads(_sanitizar(texto))
+            # O resto do pipeline espera a chave "feedback"; se faltar, força um retry.
+            if "feedback" not in resultado:
+                raise ValueError("JSON de feedback sem o campo 'feedback'.")
             return resultado
 
         except (json.JSONDecodeError, ValueError) as e:
             ultimo_erro = e
             if tentativa < max_tentativas:
-                espera = 2 ** (tentativa - 1)  # backoff: 1s, 2s, 4s
+                espera = 2 ** (tentativa - 1)  # backoff exponencial: 1s, 2s, 4s
                 print(f"  [Retry {tentativa}/{max_tentativas}] {str(e)} — aguardando {espera}s...")
                 time.sleep(espera)
-
         except Exception as e:
-            # Falha de rede, timeout de conexão, servidor offline, etc.
+            # Falha de rede/servidor offline/timeout de conexão.
             ultimo_erro = e
             if tentativa < max_tentativas:
                 espera = 2 ** (tentativa - 1)
                 print(f"  [Retry {tentativa}/{max_tentativas}] Erro de rede: {str(e)} — aguardando {espera}s...")
                 time.sleep(espera)
 
-    # Todas as tentativas esgotadas — devolve o esqueleto com as linhas determinísticas.
-    print(f"\n[Aviso] IA falhou após {max_tentativas} tentativas. Último erro: {str(ultimo_erro)}")
-    return {
-        "tipo_erro": "Falha no Pipeline",
-        "linha_sintoma": linha_sintoma,
-        "linha_causa": linha_causa,
-        "linha_ocorrencia": linha_sintoma,
-        "variaveis_envolvidas": "-",
-        "causa_raiz": "-",
-        "descricao_curta": f"LLM não respondeu após {max_tentativas} tentativas: {str(ultimo_erro)}",
-        "evidencia_log": "-",
-        "codigo_anotado": codigo_anotado,
-        "cwe_id": cwe_id,
-        "cwe_nome": cwe_nome
-    }
+    # Esgotou as tentativas — devolve um esqueleto com o mesmo formato (chave "feedback").
+    print(f"\n[Aviso] Feedback falhou após {max_tentativas} tentativas. Último erro: {str(ultimo_erro)}")
+    return {"feedback": f"[falha ao gerar feedback após {max_tentativas} tentativas: {str(ultimo_erro)}]"}
+
+
+def gerar_feedback_stream(codigo, analise):
+    """
+    Versão STREAMING do feedback: um GERADOR que entrega o texto TOKEN A TOKEN.
+
+    Usada pela API (endpoint /feedback via SSE). Diferenças em relação ao gerar_feedback:
+      • prompt com saida="texto" (sem envelope JSON) -> o texto que chega já é o feedback;
+      • Ollama SEM "format": "json" -> a saída é texto natural, não um objeto;
+      • em vez de acumular e retornar, faz `yield` de cada pedaço conforme o Ollama envia.
+
+    Observação (decisão registrada com o aluno-pesquisador): como aqui a saída é texto
+    puro em stream, a validação/retentativa por JSON e o filtro anti-vazamento pós-JSON
+    do gerar_feedback NÃO se aplicam a este caminho. A proibição anti-vazamento continua
+    NO PROMPT (REGRA 1); um filtro determinístico sobre o texto streamado pode ser somado
+    depois, como etapa à parte.
+    """
+    prompt = montar_prompt_feedback(codigo, analise, saida="texto")
+
+    # stream=True (requests) -> lê a resposta em pedaços; "stream": True (Ollama) -> o
+    # modelo emite token a token. SEM "format": "json" para o texto sair natural.
+    resposta = requests.post(URL_LLM_LOCAL, json={
+        "model": NOME_MODELO,
+        "prompt": prompt,
+        "stream": True,
+        "options": {"temperature": TEMPERATURA_FEEDBACK},
+    }, stream=True, timeout=120)
+
+    for linha in resposta.iter_lines():
+        if not linha:
+            continue
+        try:
+            pedaco = json.loads(linha.decode("utf-8")).get("response", "")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue  # linha keep-alive/incompleta: ignora e segue
+        if pedaco:
+            yield pedaco   # <-- cada token vai direto para o SSE (efeito "digitando")

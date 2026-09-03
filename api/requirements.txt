@@ -1,0 +1,9 @@
+# Dependências do serviço FastAPI.
+# fastapi         = o framework web (rotas, validação, docs automáticas).
+# uvicorn[standard] = o servidor ASGI que roda a app (o "motor" por trás do FastAPI).
+# requests        = usado no modo REAL para falar com o Ollama (streaming da LLM).
+# python-multipart = necessário para os endpoints de teste por upload (.c/.in).
+fastapi>=0.111
+uvicorn[standard]>=0.30
+requests>=2.31
+python-multipart>=0.0.9

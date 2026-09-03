@@ -7,7 +7,7 @@ POLÍTICA DE CONTEÚDO (anti-vazamento — ver paper Hellas et al.):
   - A correção entra como PRINCÍPIO, nunca como código pronto/copiável.
   - Nada que sirva de gabarito para uma questão específica.
   - Linguagem acessível a iniciante, em português.
-Mantenha curto e de alta precisão (a KB alimenta o prompt de feedback; menos é mais).
+Mantenha curto e de alta precisão (a KB alimenta o prompt de feedback; quanto mais objetivo melhor).
 -->
 
 # CWE-XXX — <Nome do erro>
@@ -22,7 +22,7 @@ Mantenha curto e de alta precisão (a KB alimenta o prompt de feedback; menos é
 <O que o SINTOMA e a CAUSA significam para esse erro; o que o aluno deve observar.>
 
 ## Princípio da correção (sem código)
-<A ideia geral de como evitar/corrigir — em nível de princípio, não de solução.>
+<A ideia geral de como evitar/corrigir — em nível teórico, não de solução prática (para evitar vazamento de solução conforme os trabalhos relacionados).>
 
 ## Nota do professor / convenção do curso (opcional)
 <Preenchido pelo professor quando houver algo específico do curso. Deixe vazio se não.>

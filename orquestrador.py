@@ -11,14 +11,16 @@ from src.malha2_valgrind import executar_malha_2_valgrind
 # Parser unificado: filtra o log bruto antes de enviar ao LLM
 from src.parser_logs import limpar_log_gdb
 
-# Cliente do LLM local (Ollama) que retorna a classificação forense como JSON
-from src.llm_client import classificar_erro
+# Cliente do LLM local (Ollama): classificar_erro (1ª chamada, classifica o erro) e
+# gerar_feedback (2ª chamada, escreve o feedback formativo ao aluno).
+from src.llm_client import classificar_erro, gerar_feedback
 
 # Configuração central: caminhos, interruptor da Malha 3, etc. Ver src/config.py.
 from src.config import (
     PASTA_CODIGOS,
     ARQUIVO_CSV_SAIDA,
     PASTA_ANOTADOS,
+    PASTA_FEEDBACKS,
     MALHA_3_ATIVA,
 )
 
@@ -147,6 +149,25 @@ def main():
                     fa.write(codigo_anotado)
                 print(f"  -> Código anotado salvo em: {caminho_anotado}")
 
+            # ── 2ª CHAMADA AO LLM: FEEDBACK FORMATIVO ao aluno ───────────────────
+            # Feito AQUI, no mesmo loop, usando o dict `analise_ia` que acabou de sair da
+            # classificação — EM MEMÓRIA, sem ler o CSV (que só é gravado no fim do main()).
+            # A gerar_feedback recupera internamente o doc da KB pelo CWE e devolve {"feedback":...}.
+            # Passa o código ORIGINAL: a ablação (MODO_ANOTACAO), agora DENTRO do
+            # montar_prompt_feedback, decide se usa o anotado (inline), o original + linhas
+            # (numerica) ou só o original (nenhuma).
+            print("  -> Gerando feedback formativo (LLM)...")
+            feedback_texto = gerar_feedback(codigo_fonte, analise_ia).get("feedback", "-")
+
+            # Salva o feedback como .txt por submissão: "feedback_<nome>.txt" (ex.:
+            # feedback_submissao_5274641.txt), para leitura fácil fora da planilha.
+            os.makedirs(PASTA_FEEDBACKS, exist_ok=True)
+            base = os.path.splitext(nome_arquivo)[0]   # "submissao_5274641.c" -> "submissao_5274641"
+            caminho_feedback = os.path.join(PASTA_FEEDBACKS, f"feedback_{base}.txt")
+            with open(caminho_feedback, 'w', encoding='utf-8') as ff:
+                ff.write(feedback_texto)
+            print(f"  -> Feedback salvo em: {caminho_feedback}")
+
             # A Malha 3 nunca roda quando há uma falha; a NOTA muda conforme a causa,
             # para o catálogo não dizer "erro de memória" quando foi o compilador.
             nota_malha3 = (
@@ -165,11 +186,10 @@ def main():
                 # Linhas determinísticas (vindas da ferramenta, não da IA): sintoma e causa.
                 "Linha Sintoma":   analise_ia.get("linha_sintoma", "-"),
                 "Linha Causa":     analise_ia.get("linha_causa", "-"),
-                "Variaveis":       analise_ia.get("variaveis_envolvidas", "-"),
-                "Causa Raiz":      analise_ia.get("causa_raiz", "-"),
-                "Diagnostico":     analise_ia.get("descricao_curta", "-"),
-                # Linha do log que embasa o diagnóstico (âncora anti-alucinação da IA)
+                # Linha do log que embasa o diagnóstico (âncora anti-alucinação, determinística)
                 "Evidencia Log":   "'" + analise_ia.get("evidencia_log", "-") + "'",
+                # Feedback formativo ao aluno (2ª chamada ao LLM) — o texto final gerado.
+                "Feedback":        feedback_texto,
                 "Complexidade":    nota_malha3,
                 "Metrica_Malha3":  "-",
                 "Status_Malha3":   "não executada",
@@ -196,10 +216,8 @@ def main():
                 "CWE Nome":        "-",
                 "Linha Sintoma":   "-",
                 "Linha Causa":     "-",
-                "Variaveis":       "-",
-                "Causa Raiz":      "-",
-                "Diagnostico":     "Sem erros de memória detectados.",
                 "Evidencia Log":   "-",
+                "Feedback":        "-",
                 "Complexidade":    resultado_malha3["complexidade_inferida"],
                 "Metrica_Malha3":  resultado_malha3.get("metrica_usada") or "-",
                 "Status_Malha3":   status,
@@ -217,10 +235,8 @@ def main():
                 "CWE Nome":        "-",
                 "Linha Sintoma":   "-",
                 "Linha Causa":     "-",
-                "Variaveis":       "-",
-                "Causa Raiz":      "-",
-                "Diagnostico":     "Sem erros de memória detectados.",
                 "Evidencia Log":   "-",
+                "Feedback":        "-",
                 "Complexidade":    "N/A",
                 "Metrica_Malha3":  "-",
                 "Status_Malha3":   "não executada",

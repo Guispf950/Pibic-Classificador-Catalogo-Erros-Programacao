@@ -18,6 +18,8 @@ PASTA_CODIGOS = "./data/submissoes_CE_codebench"
 # Catálogo de saída (CSV) e pasta dos códigos anotados (// @@).
 ARQUIVO_CSV_SAIDA = "./output/catalogo_erros_codebench.csv"
 PASTA_ANOTADOS = "./output/codigos_anotados"
+# Pasta dos feedbacks formativos (um .txt por submissão com erro).
+PASTA_FEEDBACKS = "./output/feedbacks"
 # Base de conhecimento (KB): um documento por CWE, recuperado por chave exata.
 PASTA_KB = "./base_conhecimento"
 
@@ -31,7 +33,16 @@ MALHA_3_ATIVA = False
 # ── LLM local (Ollama) ──────────────────────────────────────────────────────
 URL_LLM_LOCAL = "http://192.168.0.105:11434/api/generate"
 NOME_MODELO = "qwen2.5-coder:7b"
-TEMPERATURA_LLM = 0.3   # classificação = quase determinística
+
+# Duas temperaturas, uma por FASE (cada chamada ao LLM usa a sua):
+#   Classificação (1ª chamada): 0.0 = DETERMINÍSTICA. Queremos o rótulo mais estável
+#       possível; evita alucinação ao classificar o erro e é padrão no artigo "Exploring the Responses of Large Language Models to Beginner
+#       Programmers’ Help Requests" e o FLAME (outro artigo) usa 0.1 
+
+#   Feedback (2ª chamada): um pouco mais alta -> texto mais natural e didático ao aluno,
+#       sem virar imprevisível, nesse caso 0.7 
+TEMPERATURA_CLASSIFICACAO = 0.0
+TEMPERATURA_FEEDBACK = 0.7
 
 
 # ── Modo de anotação — variável dos experimentos de ablação (estilo FLAME) ──

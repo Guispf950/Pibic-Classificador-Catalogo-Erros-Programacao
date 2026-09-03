@@ -25,7 +25,7 @@ from src.deteccao_entrada import stdin_para_analise
 _SINAIS_FATAIS = ("SIGSEGV", "SIGABRT", "SIGFPE", "SIGBUS", "SIGILL", "SIGSYS", "SIGTRAP")
 
 
-def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
+def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=None):
     """
     Compila com AddressSanitizer e executa via GDB para capturar erros de acesso
     inválido (buffer overflow, use-after-free, stack overflow).
@@ -124,9 +124,13 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan"):
         binario_saida       # caminho do executável a ser depurado
     ]
 
-    # Detecta se o código lê N pelo stdin e gera entrada mínima automaticamente.
-    # Sem isso, programas com scanf bloqueiam esperando input do terminal.
-    stdin_analise = stdin_para_analise(caminho_codigo)
+    # ENTRADA: se `entrada` foi fornecida (ex.: a API repassando o caso de teste do
+    # CodeBench), ela é AUTORITATIVA — usada exatamente como veio (mesmo string vazia).
+    # Só quando `entrada is None` (uso offline) caímos na detecção por .in/heurística.
+    if entrada is not None:
+        stdin_analise = entrada
+    else:
+        stdin_analise = stdin_para_analise(caminho_codigo)
 
     # Executa o GDB passando o ambiente com ASAN_OPTIONS configurado.
     # O GDB em modo --batch repassa o `input` para o processo inferior (o binário do aluno).

@@ -117,7 +117,7 @@ def _aguardar_evento_valgrind(processo, stderr_buffer, lock,
 # MALHA 2
 # ══════════════════════════════════════════════════════════════════════════════
 
-def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind"):
+def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", entrada=None):
     """
     Executa o programa sob monitoramento do Valgrind com conexão GDB via vgdb
     para inspeção ao vivo. Detecta falhas de execução e vazamentos de memória.
@@ -165,9 +165,13 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind"):
         binario_saida
     ]
 
-    # Detecta se o código lê N pelo stdin para injetar entrada mínima automaticamente.
-    # Sem stdin, programas com scanf bloqueiam o processo do Valgrind indefinidamente.
-    stdin_analise = stdin_para_analise(caminho_codigo)
+    # ENTRADA: se `entrada` foi fornecida (ex.: a API repassando o caso de teste do
+    # CodeBench), ela é AUTORITATIVA. Só no uso offline (entrada is None) caímos na
+    # detecção por .in/heurística.
+    if entrada is not None:
+        stdin_analise = entrada
+    else:
+        stdin_analise = stdin_para_analise(caminho_codigo)
 
     # Popen (não run) porque precisamos do processo rodando em paralelo enquanto
     # observamos o stderr e (se preciso) conectamos o GDB.
