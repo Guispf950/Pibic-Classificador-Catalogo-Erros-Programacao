@@ -2,7 +2,7 @@
 
 Pipeline **determinístico** que analisa código C submetido ao juiz **CodeBench**, detecta
 erros de memória em tempo de execução, **classifica-os sem depender de IA** e usa um **LLM
-local** apenas para escrever um **feedback formativo (socrático)** ao aluno — sem entregar a
+local** apenas para escrever um **feedback formativo (socrático)** ao aluno sem entregar a
 solução pronta.
 
 A ideia central é a **agência local**: o fluxo é controlado por regras determinísticas
