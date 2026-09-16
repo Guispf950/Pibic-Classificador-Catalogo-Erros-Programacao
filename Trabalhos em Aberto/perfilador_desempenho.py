@@ -21,9 +21,9 @@ DOIS CENÁRIOS POSSÍVEIS:
 """
 
 import re
-import os                       # usado para manipular caminhos e o arquivo temporário do callgrind
-import shutil                   # remove o diretório temporário do binário nativo ao final
-import tempfile                 # cria arquivos/dirs temporários (relatório do callgrind e binário nativo)
+import os                       # caminhos e arquivo temporário do callgrind
+import shutil                   # remove o diretório temporário do binário nativo
+import tempfile                 # arquivos/dirs temporários (relatório do callgrind e binário nativo)
 import subprocess
 import warnings
 
@@ -37,18 +37,14 @@ from scipy.optimize import curve_fit
 
 def _callgrind_disponivel():
     """
-    Verifica se o Valgrind (ferramenta Callgrind) está instalado neste ambiente.
+    Verifica se o Valgrind (ferramenta Callgrind) está instalado.
 
-    Por que Callgrind e não `perf` ou Cachegrind?
-        O `perf` lê Contadores de Hardware (PMU), indisponíveis em WSL/contêineres.
-        O Cachegrind conta instruções por emulação (funciona sem PMU), mas só dá o
-        TOTAL do programa — que mistura o algoritmo com o I/O (scanf/printf).
-        O Callgrind também conta por emulação, porém atribui as instruções POR
-        FUNÇÃO e POR OBJETO (executável x libc). Isso permite somar só o que rodou
-        no binário do aluno e descartar a libc, isolando o custo do algoritmo.
-
-    A verificação é leve (`valgrind --version`); a robustez do parsing fica na
-    própria coletar_instrucoes_callgrind().
+    Callgrind, não `perf` nem Cachegrind: o `perf` lê contadores de hardware (PMU),
+    indisponíveis em WSL/contêineres; o Cachegrind conta por emulação (sem PMU), mas só dá o
+    TOTAL do programa (mistura algoritmo e I/O); o Callgrind também emula, porém atribui as
+    instruções por FUNÇÃO e por OBJETO (executável x libc), permitindo somar só o binário do
+    aluno e isolar o custo do algoritmo. Verificação leve; a robustez do parsing fica em
+    coletar_instrucoes_callgrind().
     """
     try:
         resultado = subprocess.run(
@@ -81,56 +77,41 @@ def _checar_callgrind():
 
 def detectar_parametro_escala(codigo_fonte):
     """
-    Lê o código C do aluno e determina se ele possui um parâmetro de tamanho N
-    que o orquestrador pode controlar via stdin (Cenário A) ou não (Cenário B).
+    Determina se o código tem um parâmetro de tamanho N controlável via stdin (Cenário A) ou não
+    (Cenário B). Retorna o nome da variável de escala (ex.: "n", "k") ou None.
 
-    A detecção funciona em duas etapas:
-      1. Encontra um scanf que lê EXATAMENTE um inteiro: scanf("%d", &var)
-         (exclui formatos compostos como "%d %d" que indicam entradas fixas)
-      2. Confirma que essa variável controla um laço ou uma alocação dinâmica,
-         ou seja, que ela realmente representa o "tamanho" do problema.
-
-    Retorna o nome da variável de escala (ex: "n", "k") ou None se for Cenário B.
+    Duas etapas: (1) encontra um scanf que lê EXATAMENTE um inteiro — scanf("%d", &var), excluindo
+    formatos compostos como "%d %d"; (2) confirma que a variável controla um laço ou uma alocação
+    dinâmica, ou seja, representa o "tamanho" do problema.
     """
 
-    # Remove comentários de linha (//) e de bloco (/* */) antes de analisar.
-    # Sem isso, um scanf comentado poderia ser detectado como parâmetro de escala.
+    # Remove comentários (// e /* */) antes de analisar, para não detectar um scanf comentado.
     codigo = re.sub(r'//.*', '', codigo_fonte)
     codigo = re.sub(r'/\*.*?\*/', '', codigo, flags=re.DOTALL)
 
-    # Busca scanf que lê EXATAMENTE um inteiro ("%d"), sem outros especificadores.
-    # O grupo(2) captura o nome da variável (ex: "k" em scanf("%d", &k)).
-    # Exemplos aceitos: scanf("%d", &n)  → detectado
-    # Exemplos rejeitados: scanf("%d %d", &a, &b)  → ignorado (entrada composta)
+    # scanf que lê EXATAMENTE um inteiro ("%d"); group(2) captura a variável.
+    # Aceita scanf("%d", &n); rejeita scanf("%d %d", &a, &b) (entrada composta).
     matches = list(re.finditer(
         r'scanf\s*\(\s*"(%d)"\s*,\s*&\s*(\w+)\s*\)',
         codigo
     ))
 
     for m in matches:
-        var = m.group(2)  # nome da variável lida pelo scanf (ex: "n", "k", "tam")
+        var = m.group(2)  # nome da variável lida pelo scanf
 
-        # Verifica se a variável realmente representa o "tamanho" do problema,
-        # checando se ela aparece como limite de laço ou tamanho de alocação.
+        # Confirma que a variável representa o "tamanho": limite de laço ou tamanho de alocação.
         usada_como_tamanho = (
-            # for(int i = 0; i < var; ...) — var como limite superior de for
-            re.search(rf'for\s*\([^;]*;\s*[^;]*{re.escape(var)}[^;]*;', codigo)
-            # while(i < var) ou while(var > 0) — var como condição de parada
-            or re.search(rf'while\s*\([^)]*{re.escape(var)}', codigo)
-            # malloc(var * sizeof(...)) — var como quantidade de elementos alocados
-            or re.search(rf'malloc\s*\([^)]*{re.escape(var)}', codigo)
-            # calloc(var, sizeof(...)) — mesmo caso acima com calloc
-            or re.search(rf'calloc\s*\([^)]*{re.escape(var)}', codigo)
-            # int arr[var] — VLA (Vetor de Tamanho Variável) usando var como tamanho
-            or re.search(rf'\[\s*{re.escape(var)}\s*\]', codigo)
+            re.search(rf'for\s*\([^;]*;\s*[^;]*{re.escape(var)}[^;]*;', codigo)  # limite de for
+            or re.search(rf'while\s*\([^)]*{re.escape(var)}', codigo)            # condição de while
+            or re.search(rf'malloc\s*\([^)]*{re.escape(var)}', codigo)           # qtd em malloc
+            or re.search(rf'calloc\s*\([^)]*{re.escape(var)}', codigo)           # qtd em calloc
+            or re.search(rf'\[\s*{re.escape(var)}\s*\]', codigo)                 # VLA int arr[var]
         )
 
-        # Se a variável controla tamanho, este é o parâmetro de escala do Cenário A
         if usada_como_tamanho:
             return var
 
-    # Nenhuma variável de escala encontrada → Cenário B (entrada fixa)
-    return None
+    return None   # Cenário B (entrada fixa)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -139,28 +120,22 @@ def detectar_parametro_escala(codigo_fonte):
 
 def gerar_entrada_para_n(N, formato="N_ESPACO_VALORES"):
     """
-    Gera a string que será enviada pelo stdin do programa para um dado N.
-
-    Padrão CodeBench mais comum:
-        Linha 1 → o número N (tamanho da entrada)
-        Linha 2 → N inteiros separados por espaço (os dados a processar)
-
-    Compatível com scanf("%d", &arr[i]) tanto em loop (lê um por chamada)
-    quanto em linha única — o scanf com %d ignora whitespace automaticamente.
+    Gera a string enviada pelo stdin para um dado N.
+    Padrão CodeBench mais comum: linha 1 com N, linha 2 com N inteiros separados por espaço.
+    Compatível com scanf("%d", &arr[i]) em loop ou em linha única (o %d ignora whitespace).
     """
     if formato == "N_ESPACO_VALORES":
-        # Gera N inteiros sequenciais (1, 2, 3, ..., N) separados por espaço.
-        # Usar valores crescentes em vez de constantes evita que o branch predictor
-        # da CPU otimize artificialmente o código do aluno durante a medição.
+        # N inteiros crescentes (1..N): valores crescentes evitam que o branch predictor da CPU
+        # otimize artificialmente o código durante a medição.
         valores = " ".join(str(i + 1) for i in range(N))
-        return f"{N}\n{valores}\n"  # ex: "5\n1 2 3 4 5\n"
+        return f"{N}\n{valores}\n"  # ex.: "5\n1 2 3 4 5\n"
 
     elif formato == "N_LINHA_POR_LINHA":
-        # Variante onde cada valor ocupa uma linha separada (alguns exercícios pedem isso)
+        # Variante com cada valor em uma linha (alguns exercícios pedem isso).
         valores = "\n".join(str(i + 1) for i in range(N))
-        return f"{N}\n{valores}\n"  # ex: "5\n1\n2\n3\n4\n5\n"
+        return f"{N}\n{valores}\n"  # ex.: "5\n1\n2\n3\n4\n5\n"
 
-    # Fallback: envia apenas N, sem dados adicionais (para programas que só leem o tamanho)
+    # Fallback: apenas N, sem dados adicionais.
     return f"{N}\n"
 
 
@@ -202,15 +177,12 @@ def _somar_ir_do_binario(caminho_out, nome_binario):
                     # A 1ª coluna é a contagem de instruções (removemos as vírgulas)
                     ir_str = partes[0].replace(',', '')
                     
-                    # A penúltima coluna contém a assinatura (ex: "arquivo.c:nome_da_funcao" ou apenas "nome_da_funcao")
+                    # Penúltima coluna: a assinatura (ex.: "arquivo.c:nome_da_funcao" ou "nome_da_funcao")
                     assinatura = partes[-2]
                     nome_fn = assinatura.split(':')[-1]
-                    
-                    # Remove o ruído: ignora a 'main' e funções internas de arranque do C (ex: _start, _init)
-                    # Ou seja, ele exclui três coisas:
-                    # a  libc (scanf/printf/malloc) → por serem outro objeto;
-                    # o main → excluído explicitamente pelo nome;
-                    # as funções de arranque (_start, __libc_csu_init, etc.) → excluídas pelo prefixo _.
+
+                    # Remove ruído: exclui a libc (outro objeto, já filtrado pelo alvo), o main (pelo
+                    # nome) e as funções de arranque (_start, __libc_csu_init, etc., pelo prefixo _).
                     if nome_fn != 'main' and not nome_fn.startswith('_'):
                         try:
                             total += int(ir_str)

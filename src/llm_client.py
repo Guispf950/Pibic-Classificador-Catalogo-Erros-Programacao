@@ -1,14 +1,14 @@
-import requests  # Biblioteca para fazer requisições HTTP (chamar a API do LLM)
-import json      # Para serializar/desserializar dados no formato JSON
-import re        # Para extrair as linhas do log e ancorar as anotações inline
-import sys       # Importado para uso futuro (ex: sys.exit em erros fatais)
-import time      # Para backoff entre tentativas de retry
+import requests  # requisições HTTP à API do LLM
+import json      # serialização JSON
+import re        # extração das linhas do log e ancoragem das anotações inline
+import sys       # uso futuro (ex.: sys.exit em erros fatais)
+import time      # backoff entre tentativas de retry
 
-# Configuração central: endereço/modelo/temperatura do LLM e o modo de anotação
-# (a variável dos experimentos de ablação). Ver src/config.py.
+# Config central: endereço/modelo/temperatura do LLM e o modo de anotação (ver src/config.py).
 from src.config import (
     URL_LLM_LOCAL, NOME_MODELO, MODO_ANOTACAO,
     TEMPERATURA_CLASSIFICACAO, TEMPERATURA_FEEDBACK,
+    LLM_TIMEOUT_S, LLM_KEEP_ALIVE,
 )
 
 # Classificação DETERMINÍSTICA do erro para CWE (a partir do log da ferramenta).
@@ -32,8 +32,9 @@ def _chamar_llm(prompt, tentativa=1, temperatura=TEMPERATURA_CLASSIFICACAO):
         "prompt": prompt,
         "stream": True,
         "format": "json",
+        "keep_alive": LLM_KEEP_ALIVE,              # mantém o modelo carregado (evita cold start)
         "options": {"temperature": temperatura}   # definida pela fase que chamou
-    }, stream=True, timeout=120)
+    }, stream=True, timeout=LLM_TIMEOUT_S)          # generoso: 1ª chamada carrega o modelo
 
     texto_completo = ""
     print(f"  -> [IA Analisando] (tentativa {tentativa}): \n", end="", flush=True)
@@ -63,88 +64,67 @@ def _sanitizar(texto):
 # ══════════════════════════════════════════════════════════════════════════════
 # ANOTAÇÃO INLINE DETERMINÍSTICA (inspirada no FLAME, §III-B)
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# POR QUÊ (fundamentação):
-#   O FLAME mostra, por ablação, que ANOTAR a linha do erro com um comentário no
-#   código (// @@ explicação) supera de longe passar o NÚMERO da linha em texto:
-#   no dataset deles o top-1 cai de 62,7% -> 15,8% quando se usa referência numérica.
-#   A razão é a limitação inerente de "numerical understanding" das LLMs.
-#
-# NOSSA VANTAGEM SOBRE O FLAME:
-#   No FLAME é a própria LLM que anota, e ao reformatar o código o marcador // @@
-#   desalinha — por isso eles precisam de "fuzzy matching" (similaridade de cosseno).
-#   Aqui, quem anota é o PIPELINE, ancorando o comentário na LINHA EXATA que a
-#   ferramenta (ASan/Valgrind) reportou. Isso é DETERMINÍSTICO e dispensa o fuzzy
-#   matching inteiro — mais simples e mais confiável.
-#
-# SINTOMA vs CAUSA (FCS/Lancet):
-#   A linha onde o erro DISPARA (sintoma) raramente é onde ele NASCE (causa). Como o
-#   backtrace do ASan/Valgrind dá os dois pontos (o free/creation e o uso), anotamos
-#   AMBOS — mas SÓ quando a ferramenta os fornece deterministicamente. Nada é inferido.
+# Fundamentação: o FLAME mostra por ablação que anotar a linha do erro com um comentário no
+# código (// @@ explicação) supera passar o NÚMERO da linha em texto (top-1 62,7% -> 15,8% com
+# referência numérica), devido à limitação de "numerical understanding" das LLMs.
+# Vantagem sobre o FLAME: lá é a própria LLM que anota e o marcador desalinha ao reformatar o
+# código (daí o "fuzzy matching" por cosseno); aqui quem anota é o PIPELINE, ancorando na linha
+# EXATA reportada pela ferramenta (ASan/Valgrind) — determinístico, dispensa o fuzzy matching.
+# Sintoma vs causa: a linha onde o erro DISPARA (sintoma) raramente é onde NASCE (causa). O
+# backtrace dá os dois pontos, então anota-se AMBOS, mas só quando a ferramenta os fornece.
 
-# As regras de detecção de seção (SINTOMA/CAUSA/VAZAMENTO/ORIGEM) foram extraídas para
-# um módulo próprio (src/regras_secao.py) — o único lugar que conhece o texto do ASan/
-# Valgrind. Para adicionar ou ajustar uma classe de erro, edite REGRAS_SECAO lá.
+# Regras de detecção de seção (SINTOMA/CAUSA/VAZAMENTO/ORIGEM) isoladas em src/regras_secao.py,
+# único lugar que conhece o texto do ASan/Valgrind. Ajustes de classe de erro vão em REGRAS_SECAO.
 from src.regras_secao import REGRAS_SECAO
 
 
 def _extrair_pontos_anotacao(log, nome_arquivo):
     """
-    Varre o log (idealmente o BRUTO, para não depender do que o parser manteve) e extrai,
-    de forma DETERMINÍSTICA, os pontos que a ferramenta
-    reportou no código do aluno, associando cada um a um papel:
+    Varre o log (idealmente o BRUTO) e extrai, de forma DETERMINÍSTICA, os pontos que a
+    ferramenta reportou no código do aluno, associando cada um a um papel:
 
         SINTOMA   -> onde o erro se manifesta (o acesso/uso que dispara a falha)
         CAUSA     -> onde o erro nasce (o free do bloco, ou a criação do valor não inic.)
-        VAZAMENTO -> a alocação cuja memória nunca é liberada (para leaks)
-        ORIGEM    -> onde o bloco foi alocado (informação extra, não anotada por padrão)
+        VAZAMENTO -> a alocação cuja memória nunca é liberada (leaks)
+        ORIGEM    -> onde o bloco foi alocado (extra, não anotada por padrão)
 
-    Retorna um dict {papel: (numero_da_linha, texto_do_comentario)}. Só inclui um papel
-    quando a ferramenta de fato forneceu aquela linha, nunca inventa.
+    Retorna dict {papel: (numero_da_linha, texto_do_comentario)}. Só inclui um papel quando a
+    ferramenta forneceu aquela linha; nunca inventa.
     """
     if not nome_arquivo:
         return {}
 
-    # REGEX 1 — acha "<arquivo>:<numero>" (ex.: "submissao_5.c:118") em qualquer frame.
-    #   re.escape(nome_arquivo) -> transforma o nome num literal SEGURO: o "." de ".c" é
-    #       um metacaractere (casaria qualquer char); escapado vira "\." (ponto literal).
-    #   ":(\d+)" -> dois-pontos literal, e "(\d+)" captura UM OU MAIS dígitos (\d=dígito,
-    #       +=um ou mais). Os parênteses formam o grupo 1, recuperado depois com m.group(1).
+    # REGEX 1 — "<arquivo>:<numero>" (ex.: "submissao_5.c:118") em qualquer frame. re.escape
+    # torna o nome um literal seguro (o "." de ".c" vira ponto literal); "(\d+)" captura o número.
     padrao_linha = re.compile(re.escape(nome_arquivo) + r":(\d+)")
-    # REGEX 2 — distingue frame do GDB de frame do Valgrind, para IGNORAR os do GDB.
-    #   As linhas devem vir do relatório ESTRUTURADO (que separa sintoma/free/alloc em
-    #   seções), não do backtrace linear do GDB. O truque está no formato do "at":
-    #     GDB:      "... at ./caminho/submissao.c:23"   (arquivo logo após "at ")
-    #     Valgrind: "... at 0x4001654: func (submissao.c:118)"  ("at 0x", com espaço depois)
-    #   \b = fronteira de palavra (o "at" isolado, não o "at" de "altura");
-    #   \s+ = um ou mais espaços;  \S* = qualquer sequência SEM espaço (o caminho).
-    #   Logo, "\S*<arquivo>" alcança o nome no caso do GDB, mas NÃO no do Valgrind (onde
-    #   depois de "at " vem "0x..." e um espaço, que \S* não atravessa).
+    # REGEX 2 — distingue frame do GDB do frame do Valgrind pelo formato do "at", para dar
+    # prioridade ao relatório ESTRUTURADO (que separa sintoma/free/alloc) sobre o backtrace do GDB:
+    #   GDB:      "... at ./caminho/submissao.c:23"           (arquivo logo após "at ")
+    #   Valgrind: "... at 0x4001654: func (submissao.c:118)"  ("at 0x", com espaço depois)
+    # "\S*<arquivo>" alcança o nome no caso do GDB, mas não no do Valgrind (onde \S* não atravessa
+    # o "0x..." seguido de espaço).
     padrao_gdb = re.compile(r"\bat\s+\S*" + re.escape(nome_arquivo))
 
     pontos = {}         # papel -> (linha, rotulo)
     veio_do_gdb = {}    # papel -> bool: a linha guardada veio de um frame do GDB?
     papel_atual = None  # (papel, rotulo) da seção sendo lida no momento
 
-    # ESTRATÉGIA: preferir frames ESTRUTURADOS (relatório do ASan/Valgrind, que separa
-    # sintoma/free/alloc) e usar os frames do GDB apenas como FALLBACK — quando são a única
-    # fonte. Isso é essencial para o SIGSEGV puro (null-deref), em que o ASan NÃO gera
-    # relatório e a linha só existe no backtrace do GDB. Antes esses frames eram descartados
-    # e o crash ficava sem anotação.
+    # ESTRATÉGIA: preferir frames ESTRUTURADOS e usar os do GDB só como FALLBACK — essencial para
+    # o SIGSEGV puro (null-deref), em que o ASan não gera relatório e a linha só existe no
+    # backtrace do GDB (antes esses frames eram descartados e o crash ficava sem anotação).
     for busca in log.split("\n"):
         linha = busca.strip()
 
-        # Este frame é do GDB? ("... at <caminho>/<arquivo>"). Não descartamos mais de cara;
-        # apenas marcamos, para o estruturado ter prioridade sobre ele.
+        # Frame do GDB? Não descarta de imediato; só marca, para o estruturado ter prioridade.
         eh_gdb = bool(padrao_gdb.search(linha))
 
-        # --- Detecta início/troca de SEÇÃO (primeira regra cujo regex casa) ---
+        # Detecta início/troca de SEÇÃO (primeira regra cujo regex casa).
         for papel, rotulo, rx in REGRAS_SECAO:
             if rx.search(linha):
                 papel_atual = (papel, rotulo)
                 break
 
-        # --- Extrai a linha do aluno pertencente à seção atual ---
+        # Extrai a linha do aluno pertencente à seção atual.
         if papel_atual is not None:
             m = padrao_linha.search(linha)
             if m:
@@ -155,7 +135,7 @@ def _extrair_pontos_anotacao(log, nome_arquivo):
                     pontos[papel] = (num, papel_atual[1])
                     veio_do_gdb[papel] = eh_gdb
                 elif veio_do_gdb.get(papel) and not eh_gdb:
-                    # Já tínhamos só um frame do GDB, mas chegou um ESTRUTURADO — ele vence.
+                    # Já havia só um frame do GDB, mas chegou um ESTRUTURADO — ele vence.
                     pontos[papel] = (num, papel_atual[1])
                     veio_do_gdb[papel] = False
 
@@ -164,12 +144,9 @@ def _extrair_pontos_anotacao(log, nome_arquivo):
 
 def _anotar_codigo(codigo_fonte, pontos):
     """
-    Injeta comentários `// @@ [PAPEL] explicação` no FIM das linhas exatas reportadas
-    pela ferramenta. Por decisão de projeto, anotamos apenas SINTOMA, CAUSA e VAZAMENTO
-    (os pontos que a ferramenta fornece deterministicamente).
-
-    Ancoragem determinística: como a linha vem da ferramenta, o marcador cai sempre no
-    lugar certo.
+    Injeta comentários `// @@ [PAPEL] explicação` no FIM das linhas exatas reportadas pela
+    ferramenta. Anota apenas SINTOMA, CAUSA e VAZAMENTO (os pontos determinísticos). Como a linha
+    vem da ferramenta, o marcador cai sempre no lugar certo.
     """
     if not codigo_fonte or not pontos:
         return codigo_fonte
@@ -182,8 +159,7 @@ def _anotar_codigo(codigo_fonte, pontos):
         numLinha = num - 1
         if 0 <= numLinha < len(linhas):
             comentario = f"  // @@ [{papel}] {rotulo}"
-            # Se a linha já tiver uma anotação (ex.: sintoma e causa na mesma linha),
-            # acrescenta a segunda em vez de sobrescrever.
+            # Linha já anotada (ex.: sintoma e causa na mesma linha): acrescenta em vez de sobrescrever.
             if "// @@" in linhas[numLinha]:
                 linhas[numLinha] = linhas[numLinha].rstrip() + f"  | [{papel}] {rotulo}"
             else:
@@ -191,24 +167,21 @@ def _anotar_codigo(codigo_fonte, pontos):
     return "\n".join(linhas)
 
 
-# Regex de uma DECLARAÇÃO DE VARIÁVEL SEM INICIALIZADOR: "<tipo> <nome>;".
-# Aceita tipos primitivos, ponteiros, typedefs iniciados por maiúscula (ex.: TAVL, Node)
-# e nomes terminados em _t (ex.: size_t). Exige ";" logo após o nome (sem "= ..."), o que
-# EXCLUI declarações já inicializadas ("int res = 0;") e statements comuns ("return res;",
-# que não começa com um tipo). É deliberadamente conservador — na dúvida, não casa.
+# Regex de DECLARAÇÃO DE VARIÁVEL SEM INICIALIZADOR: "<tipo> <nome>;". Aceita tipos primitivos,
+# ponteiros, typedefs iniciados por maiúscula (ex.: TAVL, Node) e nomes terminados em _t. Exige
+# ";" logo após o nome (sem "= ..."), o que exclui declarações já inicializadas ("int res = 0;")
+# e statements comuns ("return res;"). Deliberadamente conservador — na dúvida, não casa.
 _TIPO_C = r"(?:const\s+)?(?:unsigned\s+|signed\s+)?(?:int|char|short|long|float|double|void|bool|[A-Z]\w*|\w+_t)\s*\**"
 _DECL_SEM_INIT = re.compile(rf"^\s*{_TIPO_C}\s+(\w+)\s*;")
 
 
 def _fim_da_funcao(linhas, linha_abertura):
     """
-    Retorna o número (1-based) da linha do '}' que FECHA a função aberta em 'linha_abertura',
-    por CASAMENTO DE CHAVES. Ignora chaves dentro de strings "...", chars '...' e comentários
-    (// e /* */), para não ser enganado por coisas como  char c = '}';  ou  /* } */.
-
-    É o limite superior ROBUSTO da varredura (substitui a antiga janela fixa de 40 linhas):
-    garante que nunca cruzamos para a função seguinte. Se as chaves não fecharem, devolve a
-    última linha do arquivo (degradação segura).
+    Retorna o número (1-based) da linha do '}' que FECHA a função aberta em 'linha_abertura', por
+    CASAMENTO DE CHAVES. Ignora chaves em strings "...", chars '...' e comentários (// e /* */),
+    para não ser enganado por  char c = '}';  ou  /* } */.
+    É o limite superior robusto da varredura (substitui a antiga janela fixa de 40 linhas): nunca
+    cruza para a função seguinte. Se as chaves não fecharem, devolve a última linha (degradação segura).
     """
     profundidade = 0
     viu_abertura = False
@@ -255,17 +228,16 @@ def _refinar_causa_uninit(pontos, codigo_fonte):
     """
     Refina a linha de CAUSA nos erros de VALOR NÃO INICIALIZADO.
 
-    POR QUÊ: o Valgrind, para um valor não inicializado vindo da pilha, reporta a origem na
-    linha de ABERTURA DA FUNÇÃO (o frame inteiro é alocado de uma vez) — não na declaração
-    da variável. Aqui movemos a marca da CAUSA para a DECLARAÇÃO sem inicializador, que é o
-    ponto pedagogicamente correto ("você declarou X sem dar um valor").
+    Motivo: para um valor não inicializado vindo da pilha, o Valgrind reporta a origem na linha de
+    ABERTURA DA FUNÇÃO (o frame é alocado de uma vez), não na declaração da variável. A marca da
+    CAUSA é movida para a DECLARAÇÃO sem inicializador, o ponto pedagogicamente correto.
 
-    TRAVA DE SEGURANÇA (nunca piora o que já existe): só refina se
+    Trava de segurança (nunca piora o existente): só refina se
       (a) a CAUSA é do tipo "não inicializado" (pelo rótulo);
-      (b) a linha da CAUSA é mesmo uma ABERTURA DE FUNÇÃO (tem '(' e '{'), i.e., o caso do
-          frame — não uma origem de heap (malloc), que deve permanecer onde está;
+      (b) a linha da CAUSA é mesmo uma ABERTURA DE FUNÇÃO (tem '(' e '{') — não uma origem de
+          heap (malloc), que deve permanecer onde está;
       (c) existe EXATAMENTE UMA declaração sem inicializador entre a função e o uso.
-    Se qualquer condição falhar, devolve os pontos INALTERADOS (fica na linha da função).
+    Se qualquer condição falhar, devolve os pontos inalterados (fica na linha da função).
     """
     if "CAUSA" not in pontos or not codigo_fonte:
         return pontos
@@ -284,10 +256,10 @@ def _refinar_causa_uninit(pontos, codigo_fonte):
     if "(" not in linha_da_causa_txt or "{" not in linha_da_causa_txt:
         return pontos   # provavelmente origem de heap (malloc) -> mantém
 
-    # Intervalo a varrer: da abertura da função até o fim REAL dela (casamento de chaves),
-    # de modo que a varredura NUNCA cruze para a função seguinte. Se houver SINTOMA (o uso),
-    # usamos o MENOR entre ele e o fim da função — janela ainda mais justa (a declaração
-    # está sempre entre a abertura e o uso), evitando declarações de outros ramos após o uso.
+    # Intervalo a varrer: da abertura da função ao fim REAL dela (casamento de chaves), para nunca
+    # cruzar para a função seguinte. Havendo SINTOMA (o uso), usa-se o MENOR entre ele e o fim da
+    # função — janela mais justa (a declaração está sempre entre a abertura e o uso), evitando
+    # declarações de outros ramos após o uso.
     inicio = linha_causa
     fim_funcao = _fim_da_funcao(linhas, linha_causa)
     fim = min(pontos["SINTOMA"][0], fim_funcao) if "SINTOMA" in pontos else fim_funcao
@@ -313,14 +285,14 @@ def _refinar_causa_uninit(pontos, codigo_fonte):
 
 def _evidencia_do_log(log):
     """
-    Escolhe DETERMINISTICAMENTE uma linha REAL do relatório da ferramenta para servir de
-    evidência (ex.: "==NNNN== ... definitely lost" ou "ERROR: AddressSanitizer: ...").
+    Escolhe DETERMINISTICAMENTE uma linha REAL do relatório da ferramenta para servir de evidência
+    (ex.: "==NNNN== ... definitely lost" ou "ERROR: AddressSanitizer: ...").
 
-    É a rede de segurança do campo 'evidencia_log': se a LLM copiar a anotação // @@
-    (que é rótulo NOSSO, não prova) ou deixar o campo vazio, trocamos por esta linha real.
+    Rede de segurança do campo 'evidencia_log': se a LLM copiar a anotação // @@ (rótulo do
+    pipeline, não prova) ou deixar o campo vazio, ele é trocado por esta linha real.
 
-    Estratégia: retorna a PRIMEIRA linha que casa uma regra de SINTOMA/VAZAMENTO (o
-    cabeçalho do erro). Se nenhuma casar, cai na primeira linha não-vazia; no limite, "-".
+    Estratégia: retorna a PRIMEIRA linha que casa uma regra de SINTOMA/VAZAMENTO (cabeçalho do
+    erro). Sem nenhuma, cai na primeira linha não-vazia; no limite, "-".
     """
     linhas = [l.strip() for l in log.split("\n")]
     for linha in linhas:
@@ -340,34 +312,31 @@ def classificar_erro(log_limpo, codigo_fonte="", nome_arquivo="", log_bruto=""):
     """
     CLASSIFICAÇÃO 100% DETERMINÍSTICA do erro — SEM LLM.
 
-    Antes esta função chamava o LLM para preencher tipo_erro/variaveis/causa_raiz/
-    descricao_curta. Agora TODOS os campos retornados vêm da FERRAMENTA (ASan/Valgrind),
-    por regex/parsing — rápido, estável e auditável. Assim o /analisar devolve um
-    diagnóstico IMEDIATO. Os campos que só a LLM produzia (causa_raiz, descricao_curta,
-    variaveis_envolvidas) FORAM REMOVIDOS daqui: quando o aluno quiser detalhe, é o passo
-    de FEEDBACK (gerar_feedback / gerar_feedback_stream) que usa o LLM.
+    Todos os campos vêm da FERRAMENTA (ASan/Valgrind) por regex/parsing — rápido, estável e
+    auditável —, então o /analisar devolve um diagnóstico imediato. Os campos que só a LLM
+    produzia (causa_raiz, descricao_curta, variaveis_envolvidas) foram removidos daqui: o detalhe
+    fica para o passo de FEEDBACK (gerar_feedback / gerar_feedback_stream), que usa o LLM.
 
-    Retorna um dict determinístico:
-        tipo_erro, cwe_id, cwe_nome, linha_sintoma, linha_causa, linha_ocorrencia,
-        evidencia_log, codigo_anotado
+    Retorna dict determinístico: tipo_erro, cwe_id, cwe_nome, linha_sintoma, linha_causa,
+    linha_ocorrencia, evidencia_log, codigo_anotado.
     """
-    # 1) Pontos da ferramenta + código anotado inline (// @@) — determinístico.
-    #    Prefere o log BRUTO (todas as seções presentes) e cai no limpo se não vier.
+    # 1) Pontos da ferramenta + código anotado inline (// @@). Prefere o log BRUTO (todas as
+    #    seções) e cai no limpo se não vier.
     pontos = _extrair_pontos_anotacao(log_bruto or log_limpo, nome_arquivo)
-    # Refina a CAUSA de valor não inicializado (da abertura da função para a DECLARAÇÃO
-    # da variável, quando inequívoca). Determinístico, sobre o fonte.
+    # Refina a CAUSA de valor não inicializado (da abertura da função para a DECLARAÇÃO, quando
+    # inequívoca).
     pontos = _refinar_causa_uninit(pontos, codigo_fonte)
     codigo_anotado = _anotar_codigo(codigo_fonte, pontos)
 
-    # 2) Linhas determinísticas (vêm da ferramenta, não da LLM).
+    # 2) Linhas determinísticas (da ferramenta).
     linha_sintoma = str(pontos["SINTOMA"][0]) if "SINTOMA" in pontos else (
         str(pontos["VAZAMENTO"][0]) if "VAZAMENTO" in pontos else "-")
     linha_causa = str(pontos["CAUSA"][0]) if "CAUSA" in pontos else "-"
 
-    # 3) CWE + nome + tipo_erro — todos determinísticos, da assinatura do log da ferramenta.
+    # 3) CWE + nome + tipo_erro — determinísticos, da assinatura do log.
     cwe_id, cwe_nome, tipo_erro = classificar_cwe_tipo(log_bruto or log_limpo)
 
-    # 4) Evidência: uma linha REAL do relatório (âncora anti-alucinação; determinística).
+    # 4) Evidência: linha REAL do relatório (âncora anti-alucinação).
     evidencia_log = _evidencia_do_log(log_bruto or log_limpo)
 
     return {
@@ -379,7 +348,7 @@ def classificar_erro(log_limpo, codigo_fonte="", nome_arquivo="", log_bruto=""):
         # Compatibilidade com quem lê "linha_ocorrencia" (= sintoma).
         "linha_ocorrencia": linha_sintoma,
         "evidencia_log":   evidencia_log,
-        # Código com as anotações inline (// @@), para o orquestrador salvar / o feedback usar.
+        # Código com anotações inline (// @@), para o orquestrador salvar / o feedback usar.
         "codigo_anotado":  codigo_anotado,
     }
 
@@ -393,21 +362,18 @@ def montar_prompt_feedback(codigo, analise, saida="json"):
     """
     Monta o PROMPT do feedback formativo — FONTE ÚNICA das regras pedagógicas.
 
-    É usada em DOIS caminhos, para as regras nunca divergirem:
-      • gerar_feedback (offline/catálogo): saida="json" -> pede um JSON {"feedback": ...},
-        que é validado/retentado (comportamento original, inalterado).
-      • gerar_feedback_stream (API/SSE):   saida="texto" -> pede TEXTO puro, para os
-        tokens do Ollama irem direto ao aluno, sem envelope JSON no meio do stream.
-
-    Só a INSTRUÇÃO FINAL muda entre os dois; o corpo (regras + exemplos + diagnóstico)
-    é idêntico.
+    Usada em dois caminhos, para as regras nunca divergirem:
+      • gerar_feedback (offline/catálogo): saida="json" -> JSON {"feedback": ...}, validado/retentado.
+      • gerar_feedback_stream (API/SSE):   saida="texto" -> TEXTO puro, para os tokens do Ollama
+        irem direto ao aluno, sem envelope JSON no stream.
+    Só a INSTRUÇÃO FINAL muda entre os dois; o corpo (regras + exemplos + diagnóstico) é idêntico.
     """
-    # Recupera o documento curado do erro por CHAVE EXATA (o CWE já apurado na 1ª fase).
-    # Sem documento para esse CWE, doc_kb = "" e o prompt segue sem ele (degradação graciosa).
+    # Recupera o documento curado do erro por CHAVE EXATA (o CWE apurado na 1ª fase). Sem documento,
+    # doc_kb = "" e o prompt segue sem ele (degradação graciosa).
     cwe_id = analise.get("cwe_id", "-")
     doc_kb = recuperar_kb(cwe_id)
 
-    # Campos da classificação que dão CONTEXTO ao feedback (todos DETERMINÍSTICOS agora).
+    # Campos da classificação que dão contexto ao feedback (todos determinísticos).
     tipo_erro     = analise.get("tipo_erro", "-")
     cwe_nome      = analise.get("cwe_nome", "-")
     linha_sintoma = analise.get("linha_sintoma", "-")
@@ -416,14 +382,13 @@ def montar_prompt_feedback(codigo, analise, saida="json"):
     # A seção da KB só entra no prompt se houver documento (evita cabeçalho vazio).
     secao_kb = f"\n===== MATERIAL DE APOIO (sobre este tipo de erro) =====\n{doc_kb}\n" if doc_kb else ""
 
-    # ── ABLAÇÃO (MODO_ANOTACAO) — antes vivia na classificação (via LLM); agora que a
-    #    classificação é determinística, a ablação passa a viver AQUI, no ÚNICO passo que
-    #    ainda usa LLM. Controla COMO a localização do erro chega ao modelo (variável
-    #    experimental estilo FLAME):
-    #      inline   -> código com marcadores // @@ (localização embutida no código)
+    # ── ABLAÇÃO (MODO_ANOTACAO): com a classificação já determinística, a ablação vive aqui, no
+    #    único passo que ainda usa LLM. Controla COMO a localização do erro chega ao modelo
+    #    (variável experimental estilo FLAME):
+    #      inline   -> código com marcadores // @@ (localização embutida)
     #      numerica -> código original + as linhas do erro em TEXTO (o "FLAME_num")
-    #      nenhuma  -> código original, sem nenhuma dica de linha (baseline)
-    #    OBS: 'codigo' recebido deve ser o ORIGINAL; o anotado vem de analise["codigo_anotado"].
+    #      nenhuma  -> código original, sem dica de linha (baseline)
+    #    'codigo' recebido é o ORIGINAL; o anotado vem de analise["codigo_anotado"].
     codigo_anotado = analise.get("codigo_anotado", "") or codigo
     if MODO_ANOTACAO == "numerica":
         cabecalho_codigo = "===== CÓDIGO DO ALUNO ====="
@@ -513,27 +478,26 @@ def gerar_feedback(codigo, analise, max_tentativas=3):
     """
     Gera o FEEDBACK FORMATIVO ao aluno (2ª chamada ao LLM, separada da classificação).
 
-    A 1ª chamada (classificar_erro) CLASSIFICA o erro; esta aqui CONVERSA com o aluno:
-    explica o erro e o guia a corrigir sozinho, SEM entregar a solução pronta.
+    A 1ª chamada (classificar_erro) classifica o erro; esta conversa com o aluno: explica o erro e
+    o guia a corrigir sozinho, sem entregar a solução pronta.
 
-    Parâmetros (tudo vem PRONTO da 1ª fase — nada é recalculado):
+    Parâmetros (tudo vem pronto da 1ª fase, nada é recalculado):
         codigo:  o código do aluno a exibir (idealmente o já anotado com // @@).
-        analise: o dict da classificação DETERMINÍSTICA (tipo_erro, cwe_id, linhas, codigo_anotado...).
-                 É o MESMO objeto que classificar_erro retornou (ou a linha lida da planilha).
+        analise: o dict da classificação determinística (tipo_erro, cwe_id, linhas, codigo_anotado...).
+                 É o mesmo objeto que classificar_erro retornou (ou a linha lida da planilha).
 
-    Retorna: o dict {"feedback": "<texto>"} (ou um esqueleto de falha após os retries).
+    Retorna dict {"feedback": "<texto>"} (ou um esqueleto de falha após os retries).
     """
-    # O prompt vem do construtor único (regras pedagógicas centralizadas). saida="json"
-    # preserva o comportamento original: Ollama em format=json e leitura via json.loads.
+    # Prompt do construtor único (regras pedagógicas centralizadas). saida="json" preserva o
+    # comportamento original: Ollama em format=json e leitura via json.loads.
     prompt = montar_prompt_feedback(codigo, analise, saida="json")
 
     ultimo_erro = None
     for tentativa in range(1, max_tentativas + 1):
         try:
             print(f"  -> [IA Feedback] (tentativa {tentativa}):")
-            # Feedback = temperatura um pouco mais alta (TEMPERATURA_FEEDBACK): texto mais
-            # natural/didático. O Ollama está em format=json, então a saída é SEMPRE um JSON
-            # válido (garantia da API) — daí a leitura abaixo não quebra.
+            # Feedback com temperatura mais alta (TEMPERATURA_FEEDBACK): texto mais natural. Ollama
+            # em format=json garante saída JSON válida, então a leitura abaixo não quebra.
             texto = _chamar_llm(prompt, tentativa, temperatura=TEMPERATURA_FEEDBACK)
             if not texto.strip():
                 raise ValueError("Ollama retornou resposta vazia (nenhum token gerado).")
@@ -565,18 +529,17 @@ def gerar_feedback(codigo, analise, max_tentativas=3):
 
 def gerar_feedback_stream(codigo, analise):
     """
-    Versão STREAMING do feedback: um GERADOR que entrega o texto TOKEN A TOKEN.
+    Versão STREAMING do feedback: um gerador que entrega o texto TOKEN A TOKEN.
 
     Usada pela API (endpoint /feedback via SSE). Diferenças em relação ao gerar_feedback:
       • prompt com saida="texto" (sem envelope JSON) -> o texto que chega já é o feedback;
-      • Ollama SEM "format": "json" -> a saída é texto natural, não um objeto;
+      • Ollama SEM "format": "json" -> saída em texto natural, não objeto;
       • em vez de acumular e retornar, faz `yield` de cada pedaço conforme o Ollama envia.
 
-    Observação (decisão registrada com o aluno-pesquisador): como aqui a saída é texto
-    puro em stream, a validação/retentativa por JSON e o filtro anti-vazamento pós-JSON
-    do gerar_feedback NÃO se aplicam a este caminho. A proibição anti-vazamento continua
-    NO PROMPT (REGRA 1); um filtro determinístico sobre o texto streamado pode ser somado
-    depois, como etapa à parte.
+    Como a saída é texto puro em stream, a validação/retentativa por JSON e o filtro
+    anti-vazamento pós-JSON do gerar_feedback não se aplicam aqui. A proibição anti-vazamento
+    continua NO PROMPT (REGRA 1); um filtro determinístico sobre o texto streamado pode ser
+    somado depois, como etapa à parte.
     """
     prompt = montar_prompt_feedback(codigo, analise, saida="texto")
 
@@ -586,8 +549,9 @@ def gerar_feedback_stream(codigo, analise):
         "model": NOME_MODELO,
         "prompt": prompt,
         "stream": True,
+        "keep_alive": LLM_KEEP_ALIVE,              # mantém o modelo carregado (evita cold start)
         "options": {"temperature": TEMPERATURA_FEEDBACK},
-    }, stream=True, timeout=120)
+    }, stream=True, timeout=LLM_TIMEOUT_S)          # generoso: 1ª chamada carrega o modelo
 
     for linha in resposta.iter_lines():
         if not linha:

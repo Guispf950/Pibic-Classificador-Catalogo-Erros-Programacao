@@ -1,18 +1,13 @@
 """
 app.py — Serviço FastAPI do pipeline (esqueleto testável).
-==========================================================
 
-Expõe DOIS endpoints, exatamente como combinado:
+Expõe dois endpoints:
   • POST /analisar  -> resposta JSON (rápida): diagnóstico determinístico do erro.
   • POST /feedback  -> resposta em STREAMING (SSE): o feedback ao aluno "sendo digitado".
 
-Como testar AGORA (modo mock, sem depender de Ollama/gcc/Valgrind/Docker):
-  1) pip install -r requirements.txt
-  2) uvicorn app:app --reload           (sobe o servidor em http://127.0.0.1:8000)
-  3) /analisar  -> teste no Insomnia/Postman/curl (é um POST JSON comum).
-  4) /feedback  -> teste com `curl -N` (ver README) ou abrindo http://127.0.0.1:8000/teste
-
-Para ligar o pipeline REAL, veja pipeline_adapter.py (variável USAR_PIPELINE_REAL).
+Teste em modo mock (sem Ollama/gcc/Valgrind/Docker): instalar requirements.txt, subir com
+`uvicorn app:app --reload`, chamar /analisar (POST JSON) e /feedback (`curl -N` ou /teste no
+navegador). Para o pipeline REAL, ver pipeline_adapter.py (variável USAR_PIPELINE_REAL).
 """
 
 import json
@@ -24,34 +19,33 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from pydantic import BaseModel
 
-# Shim de caminho: garante que a pasta api/ (onde está pipeline_adapter.py) esteja no
-# sys.path. Assim `import pipeline_adapter` funciona tanto rodando de dentro de api/
-# (uvicorn app:app) quanto da RAIZ do projeto (uvicorn api.app:app).
+# Shim de caminho: coloca api/ (onde está pipeline_adapter.py) no sys.path, para
+# `import pipeline_adapter` funcionar tanto de dentro de api/ (uvicorn app:app) quanto da raiz
+# (uvicorn api.app:app).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# O "adaptador" isola a API do pipeline: aqui a API só chama funções de alto nível,
-# e o adapter decide se responde com dados MOCK (padrão) ou chama o pipeline real.
+# O adaptador isola a API do pipeline: a API só chama funções de alto nível, e o adapter decide
+# entre dados MOCK (padrão) ou o pipeline real.
 import pipeline_adapter as pipe
 
-# Cria a aplicação FastAPI. O objeto `app` é o que o uvicorn carrega ("app:app").
+# Aplicação FastAPI (o objeto `app` é o que o uvicorn carrega em "app:app").
 app = FastAPI(title="Servico de Analise e Feedback - PIBIC", version="0.1.0")
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
-# CORS controla quais ORIGENS (domínios) do navegador podem chamar esta API por
-# JavaScript. A página de teste (teste_sse.html) e, no futuro, o front do CodeBench
-# rodam em outra origem; sem liberar o CORS, o navegador BLOQUEIA a chamada.
-# Em produção, troque "*" pela origem exata do CodeBench.
+# ── CORS ──
+# Controla quais origens (domínios) do navegador podem chamar esta API por JavaScript. A página de
+# teste e, no futuro, o front do CodeBench rodam em outra origem; sem CORS o navegador bloqueia a
+# chamada. Em produção, "*" deve virar a origem exata do CodeBench.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # DEV: libera todo mundo. PROD: coloque o domínio do CodeBench.
+    allow_origins=["*"],          # DEV: libera todas. PROD: domínio do CodeBench.
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ── Modelos de entrada (validação automática pelo Pydantic) ───────────────────
-# O FastAPI usa estes modelos para: (1) validar o JSON recebido, (2) gerar a doc
-# automática em /docs. Se faltar um campo obrigatório, a API já responde 422.
+# ── Modelos de entrada (validação automática pelo Pydantic) ──
+# O FastAPI usa estes modelos para validar o JSON recebido e gerar a doc em /docs. Campo
+# obrigatório ausente -> resposta 422.
 class AnalisarReq(BaseModel):
     codigo: str                      # código-fonte C do aluno
     entrada: str = ""                # conteúdo do caso de teste (.in), se houver
@@ -64,37 +58,35 @@ class FeedbackReq(BaseModel):
     nome_arquivo: str = "submissao.c"
 
 
-# ── Utilitário: formata um evento no padrão SSE ───────────────────────────────
-# SSE (Server-Sent Events) transmite eventos de texto. O FORMATO na rede é simples:
-# cada evento é uma linha "data: <conteúdo>" seguida de UMA LINHA EM BRANCO.
-# Aqui mandamos um JSON por evento, para o cliente saber o "tipo" de cada pedaço.
+# ── Utilitário: formata um evento no padrão SSE ──
+# SSE (Server-Sent Events) transmite eventos de texto: cada evento é uma linha "data: <conteúdo>"
+# seguida de uma linha em branco. Aqui vai um JSON por evento, para o cliente saber o tipo de cada.
 def sse(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-# ── Campos INTERNOS que não devem sair na resposta ao cliente ─────────────────
-# `codigo_anotado` (código com // @@ [SINTOMA]/[CAUSA]) é uso INTERNO: serve para
-# montar o prompt do feedback. Devolvê-lo ao cliente entregaria a localização exata
-# do erro — o que fura a proposta socrática. Fica no dict internamente, mas é
-# removido do que vai pela rede.
+# ── Campos INTERNOS que não saem na resposta ao cliente ──
+# `codigo_anotado` (código com // @@ [SINTOMA]/[CAUSA]) é de uso interno para montar o prompt do
+# feedback. Devolvê-lo entregaria a localização exata do erro, furando a proposta socrática. Fica
+# no dict internamente, mas é removido do que trafega pela rede.
 _CHAVES_INTERNAS = {"codigo_anotado"}
 
 
 def _sem_internos(analise: dict) -> dict:
-    """Devolve uma cópia da análise SEM os campos de uso interno (não vazam ao cliente)."""
+    """Cópia da análise sem os campos de uso interno (não vazam ao cliente)."""
     return {k: v for k, v in analise.items() if k not in _CHAVES_INTERNAS}
 
 
-# ── Gerador de eventos do feedback (usado pelo /feedback e pelo /feedback_arquivo) ──
-# Fonte ÚNICA da lógica de streaming, para os dois endpoints não divergirem.
+# ── Gerador de eventos do feedback (usado por /feedback e /feedback_arquivo) ──
+# Fonte única da lógica de streaming, para os dois endpoints não divergirem.
 def _eventos_feedback(codigo: str, entrada: str, nome_arquivo: str):
-    # 1) progresso imediato: evita a "tela parada" enquanto a análise roda.
+    # 1) progresso imediato: evita a tela parada enquanto a análise roda.
     yield sse({"tipo": "status", "msg": "Analisando seu código..."})
     # 2) parte pesada e determinística (ASan/Valgrind) roda ANTES do LLM.
     analise = pipe.analisar(codigo, entrada, nome_arquivo)
-    # Ao cliente vai a versão SEM campos internos (sem codigo_anotado)...
+    # Ao cliente vai a versão sem campos internos (sem codigo_anotado)...
     yield sse({"tipo": "diagnostico", "dados": _sem_internos(analise)})
-    # 3) ...mas o passo de feedback usa a análise COMPLETA (precisa do codigo_anotado).
+    # 3) ...mas o feedback usa a análise completa (precisa do codigo_anotado).
     for token in pipe.stream_feedback(analise, codigo):
         yield sse({"tipo": "token", "texto": token})
     # 4) fim do stream.
@@ -109,8 +101,7 @@ _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 @app.post("/analisar")
 def analisar(req: AnalisarReq):
     """
-    Recebe o código + a entrada, roda a análise (determinística) e devolve o
-    diagnóstico como JSON. É rápido de testar no Insomnia (POST com corpo JSON).
+    Recebe código + entrada, roda a análise determinística e devolve o diagnóstico como JSON.
     """
     resultado = pipe.analisar(req.codigo, req.entrada, req.nome_arquivo)
     return JSONResponse(_sem_internos(resultado))
@@ -120,17 +111,15 @@ def analisar(req: AnalisarReq):
 @app.post("/feedback")
 def feedback(req: FeedbackReq):
     """
-    Gera o feedback ao aluno em STREAMING. A ideia: o aluno não espera olhando uma
-    tela parada — ele recebe eventos conforme o servidor avança:
-      1) 'status'       -> "analisando seu código..." (feedback imediato de progresso)
-      2) 'diagnostico'  -> o resultado determinístico (tipo do erro, linha) já pronto
-      3) 'token'*       -> os pedaços do texto do LLM, um a um (efeito "digitando")
-      4) 'fim'          -> sinaliza o término
+    Gera o feedback ao aluno em STREAMING: o aluno recebe eventos conforme o servidor avança:
+      1) 'status'       -> progresso imediato ("analisando...")
+      2) 'diagnostico'  -> resultado determinístico (tipo do erro, linha) já pronto
+      3) 'token'*       -> pedaços do texto do LLM, um a um (efeito "digitando")
+      4) 'fim'          -> término
     """
 
-    # StreamingResponse + media_type text/event-stream = resposta SSE. O gerador
-    # compartilhado (_eventos_feedback) é o coração do streaming: cada yield envia um
-    # pedaço na hora, sem esperar o resto ficar pronto.
+    # StreamingResponse + media_type text/event-stream = resposta SSE. O gerador compartilhado
+    # (_eventos_feedback) envia cada pedaço na hora, sem esperar o resto ficar pronto.
     return StreamingResponse(
         _eventos_feedback(req.codigo, req.entrada, req.nome_arquivo),
         media_type="text/event-stream",
@@ -141,11 +130,11 @@ def feedback(req: FeedbackReq):
 # ══════════════════════════════════════════════════════════════════════════════
 # Endpoints de TESTE por UPLOAD DE ARQUIVO (multipart) — sem escapar \n na mão.
 # ══════════════════════════════════════════════════════════════════════════════
-# Feitos para testar no Insomnia/Postman/curl anexando os arquivos direto:
+# Para testar anexando os arquivos direto (Insomnia/Postman/curl):
 #   • codigo  -> o .c do aluno (obrigatório)
 #   • entrada -> o .in do caso de teste (opcional; ausente = sem stdin)
-# Assim você NÃO precisa colocar o código dentro de um JSON com \n. A integração
-# real com o CodeBench continua usando /analisar e /feedback (JSON).
+# Dispensa colocar o código dentro de um JSON com \n. A integração real com o CodeBench continua
+# usando /analisar e /feedback (JSON).
 
 async def _ler_upload(arquivo) -> str:
     """Lê um UploadFile e devolve o conteúdo como texto (ou '' se não veio)."""

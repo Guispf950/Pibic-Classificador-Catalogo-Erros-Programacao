@@ -24,14 +24,11 @@ from src.config import (
     MALHA_3_ATIVA,
 )
 
-# ── Malha 3: Perfilamento de complexidade (módulo exploratório) ───────────────
-# O perfilador ainda precisa de fundamentação teorica para compor o pipeline,por isso consta na pasta "Trabalhos em Aberto"
-# (fase exploratória), fora de src/. Por isso ele é carregado por caminho
-# explícito via importlib, e não por um import de pacote comum.
-
-# Import protegido: se o arquivo não existir ou faltar alguma dependência
-# (numpy/scipy), a Malha 3 é apenas pulada — o pipeline de memória (Malhas 1 e 2)
-# continua funcionando normalmente.
+# ── Malha 3: Perfilamento de complexidade (módulo exploratório) ──
+# O perfilador ainda precisa de fundamentação teórica para compor o pipeline, por isso fica em
+# "Trabalhos em Aberto" (fora de src/) e é carregado por caminho explícito via importlib.
+# Import protegido: se o arquivo não existir ou faltar dependência (numpy/scipy), a Malha 3 é
+# pulada e o pipeline de memória (Malhas 1 e 2) continua normalmente.
 executar_malha_3_desempenho = None
 try:
     _PERF_PATH = os.path.join(
@@ -128,16 +125,14 @@ def main():
                 codigo_fonte = f.read()
 
             print(f"  -> Acionando IA Local para classificação forense...")
-            # nome_arquivo é necessário para ancorar as anotações inline (// @@) nas
-            # linhas exatas que a ferramenta reportou dentro do código do aluno.
-            # log_bruto é passado para a EXTRAÇÃO das linhas rodar sobre o relatório
-            # completo (todas as seções), sem depender do que o parser manteve.
+            # nome_arquivo ancora as anotações inline (// @@) nas linhas exatas reportadas pela
+            # ferramenta. log_bruto faz a extração das linhas rodar sobre o relatório completo
+            # (todas as seções), sem depender do que o parser manteve.
             analise_ia = classificar_erro(log_limpo, codigo_fonte, nome_arquivo, log_bruto=log_bruto)
 
-            # ── SAÍDA: código do aluno com as anotações inline (// @@) ───────────
-            # Salva o código anotado como "<nome>_AnotacaoErro.c" (só quando houve
-            # anotação de fato), mostrando NO código onde está o sintoma e a causa do erro.
-            
+            # ── SAÍDA: código do aluno anotado (// @@) ──
+            # Salva como "<nome>_AnotacaoErro.c" só quando houve anotação de fato, marcando no
+            # código onde estão o sintoma e a causa.
             codigo_anotado = analise_ia.get("codigo_anotado", "")
 
             if codigo_anotado and "// @@" in codigo_anotado:
@@ -149,13 +144,12 @@ def main():
                     fa.write(codigo_anotado)
                 print(f"  -> Código anotado salvo em: {caminho_anotado}")
 
-            # ── 2ª CHAMADA AO LLM: FEEDBACK FORMATIVO ao aluno ───────────────────
-            # Feito AQUI, no mesmo loop, usando o dict `analise_ia` que acabou de sair da
-            # classificação — EM MEMÓRIA, sem ler o CSV (que só é gravado no fim do main()).
-            # A gerar_feedback recupera internamente o doc da KB pelo CWE e devolve {"feedback":...}.
-            # Passa o código ORIGINAL: a ablação (MODO_ANOTACAO), agora DENTRO do
-            # montar_prompt_feedback, decide se usa o anotado (inline), o original + linhas
-            # (numerica) ou só o original (nenhuma).
+            # ── 2ª CHAMADA AO LLM: FEEDBACK FORMATIVO ao aluno ──
+            # Feito no mesmo loop, usando o dict `analise_ia` recém-classificado — em memória, sem
+            # ler o CSV (gravado só no fim do main()). gerar_feedback recupera o doc da KB pelo CWE
+            # e devolve {"feedback":...}. Passa o código ORIGINAL: a ablação (MODO_ANOTACAO), dentro
+            # de montar_prompt_feedback, decide entre anotado (inline), original+linhas (numerica)
+            # ou só original (nenhuma).
             print("  -> Gerando feedback formativo (LLM)...")
             feedback_texto = gerar_feedback(codigo_fonte, analise_ia).get("feedback", "-")
 

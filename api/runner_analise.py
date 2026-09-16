@@ -1,29 +1,25 @@
 """
 runner_analise.py — roda DENTRO do contêiner Docker (é o "programa" da imagem).
-==============================================================================
-POR QUE ISSO EXISTE (arquitetura):
-  A DETECÇÃO do erro executa CÓDIGO NÃO CONFIÁVEL (o do aluno), então roda
-  ISOLADA dentro do contêiner. Aqui reaproveitamos EXATAMENTE o seu pipeline
-  (Malha 1 ASan+GDB e Malha 2 Valgrind), para ter PARIDADE com o orquestrador.
-  O LLM (classificação e feedback) fica FORA do contêiner, na API do host —
-  porque o contêiner roda com --network none (não pode falar com o Ollama).
 
-O QUE ESTE SCRIPT FAZ:
-  1. Recebe o caminho do .c do aluno (montado em /work, só-leitura).
-  2. Roda a cascata de detecção (Malha 1 -> Malha 2), como o orquestrador.
-  3. Se achou erro, limpa o log (limpar_log_gdb).
-  4. Imprime UM JSON (após um marcador) com o resultado, para o sandbox.py ler.
+A DETECÇÃO executa CÓDIGO NÃO CONFIÁVEL (o do aluno), então roda isolada no contêiner,
+reaproveitando o mesmo pipeline (Malha 1 ASan+GDB e Malha 2 Valgrind) para paridade com o
+orquestrador. O LLM (classificação e feedback) fica fora do contêiner, na API do host, porque o
+contêiner roda com --network none (sem acesso ao Ollama).
 
-SAÍDA (stdout): os prints das malhas (ruído) e, ao final, a linha marcadora
-  ===RESULTADO_JSON=== seguida de uma linha JSON. O sandbox.py pega só o JSON.
+O que o script faz: recebe o caminho do .c do aluno (montado em /work, só-leitura), roda a cascata
+de detecção (Malha 1 -> Malha 2), limpa o log se achou erro (limpar_log_gdb) e imprime um JSON
+após um marcador, para o sandbox.py ler.
+
+Saída (stdout): os prints das malhas (ruído) e, ao final, a linha ===RESULTADO_JSON=== seguida de
+uma linha JSON. O sandbox.py pega só o JSON.
 """
 
 import sys
 import os
 import json
 
-# /app é onde o Dockerfile copia o pacote `src/`. Garantimos que ele está no path
-# para os imports `from src...` funcionarem dentro do contêiner.
+# /app é onde o Dockerfile copia o pacote `src/`; garante que esteja no path para os imports
+# `from src...` funcionarem dentro do contêiner.
 sys.path.insert(0, "/app")
 
 from src.malha1_asan import executar_malha_1_asan          # ASan + GDB (erros espaciais)
@@ -92,9 +88,9 @@ def _ler_entrada_montada():
     """
     Lê o caso de teste que o sandbox montou em /work/entrada.in.
 
-    Se o arquivo EXISTE (a API sempre o grava, mesmo vazio), seu conteúdo é a entrada
-    AUTORITATIVA — retornamos a string (pode ser ""). Se NÃO existe (uso fora da API),
-    retornamos None, e as malhas caem na sua detecção offline.
+    Se o arquivo existe (a API sempre o grava, mesmo vazio), seu conteúdo é a entrada AUTORITATIVA
+    (retorna a string, que pode ser ""). Se não existe (uso fora da API), retorna None e as malhas
+    caem na detecção offline.
     """
     caminho_in = "/work/entrada.in"
     if os.path.isfile(caminho_in):

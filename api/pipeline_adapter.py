@@ -1,33 +1,30 @@
 """
 pipeline_adapter.py — a "cola" entre a API (app.py) e o pipeline (src/).
-========================================================================
-Por que existe um adaptador?
-  A API não deve conhecer os detalhes do pipeline. Ela só chama duas funções:
-      analisar(codigo, entrada, nome)   -> dict com o diagnóstico
-      stream_feedback(analise, codigo)  -> gerador que produz o texto token a token
-  Aqui decidimos se essas funções respondem com dados MOCK (padrão, para testar a
-  API/SSE já) ou chamam o PIPELINE REAL (sandbox Docker + src/llm_client).
 
-ARQUITETURA DO MODO REAL (escolhas confirmadas com o pesquisador):
-  • DETECÇÃO -> roda ISOLADA no contêiner Docker (sandbox.py), reaproveitando as suas
-    Malhas 1 e 2. Devolve o log determinístico do erro.
-  • CLASSIFICAÇÃO e FEEDBACK -> rodam no HOST (precisam de rede para o Ollama, que o
-    contêiner não tem). classificar_erro() e gerar_feedback_stream() vêm do seu src/.
+A API não conhece os detalhes do pipeline; só chama duas funções:
+    analisar(codigo, entrada, nome)   -> dict com o diagnóstico
+    stream_feedback(analise, codigo)  -> gerador que produz o texto token a token
+Este módulo decide se elas respondem com dados MOCK (padrão, para testar API/SSE) ou chamam o
+PIPELINE REAL (sandbox Docker + src/llm_client).
 
-Como alternar (variáveis de ambiente):
-  USAR_PIPELINE_REAL=1   -> liga o pipeline real (senão, MOCK).
-  MODO_SANDBOX=docker    -> detecção no contêiner (senão, sandbox devolve mock).
-  Rode a API a partir da RAIZ do projeto (ver README) para o `import src...` e a base
-  de conhecimento (./base_conhecimento) resolverem.
+Arquitetura do modo real:
+  • DETECÇÃO -> roda ISOLADA no contêiner Docker (sandbox.py), reaproveitando as Malhas 1 e 2.
+    Devolve o log determinístico do erro.
+  • CLASSIFICAÇÃO e FEEDBACK -> rodam no HOST (precisam de rede para o Ollama, indisponível no
+    contêiner). classificar_erro() e gerar_feedback_stream() vêm de src/.
+
+Variáveis de ambiente: USAR_PIPELINE_REAL=1 liga o pipeline real (senão MOCK); MODO_SANDBOX=docker
+faz a detecção no contêiner (senão o sandbox devolve mock). A API deve rodar a partir da RAIZ do
+projeto (ver README) para o `import src...` e a base de conhecimento (./base_conhecimento) resolverem.
 """
 
 import os
 import sys
 import time
 
-# ── Shim de caminho: garante que a RAIZ do projeto está no sys.path ───────────
-# Assim `from src...` funciona mesmo se a API for iniciada de dentro de api/.
-# (A raiz é a pasta-mãe de api/, onde ficam src/ e base_conhecimento/.)
+# ── Shim de caminho: coloca a RAIZ do projeto no sys.path ──
+# Faz `from src...` funcionar mesmo com a API iniciada de dentro de api/ (a raiz é a pasta-mãe de
+# api/, onde ficam src/ e base_conhecimento/).
 _RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _RAIZ not in sys.path:
     sys.path.insert(0, _RAIZ)
@@ -52,9 +49,8 @@ def analisar(codigo: str, entrada: str, nome_arquivo: str) -> dict:
             "mock": True,
         }
 
-    # ---- MODO REAL ------------------------------------------------------------
-    # Imports adiados (só quando o modo real está ligado): evita exigir src/ e rede
-    # quando você só quer testar a API em mock.
+    # ---- MODO REAL ----
+    # Imports adiados (só no modo real): evita exigir src/ e rede ao testar a API em mock.
     from sandbox import rodar_em_sandbox               # detecção isolada (Docker)
     from src.llm_client import classificar_erro         # 1ª chamada ao LLM (host)
 
@@ -93,8 +89,7 @@ def analisar(codigo: str, entrada: str, nome_arquivo: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # FUNÇÃO 2 — stream_feedback(): PRODUZ o texto do feedback token a token
 # ══════════════════════════════════════════════════════════════════════════════
-# É um GERADOR (usa `yield`): entrega pedaços conforme são produzidos — o que
-# permite o streaming (SSE) até o navegador.
+# Gerador (usa `yield`): entrega pedaços conforme são produzidos, o que permite o streaming (SSE).
 def stream_feedback(analise: dict, codigo: str):
     # Se a análise indicou que NÃO houve erro, não há feedback a gerar.
     if analise.get("sem_erro"):
@@ -114,9 +109,9 @@ def stream_feedback(analise: dict, codigo: str):
             time.sleep(0.05)
         return
 
-    # ---- MODO REAL: streama tokens de verdade do Ollama (texto puro) ----------
-    # gerar_feedback_stream reutiliza o MESMO prompt socrático/anti-vazamento do
-    # gerar_feedback (via montar_prompt_feedback), mas em modo texto e em stream.
+    # ---- MODO REAL: streama tokens de verdade do Ollama (texto puro) ----
+    # gerar_feedback_stream reutiliza o mesmo prompt socrático/anti-vazamento do gerar_feedback
+    # (via montar_prompt_feedback), mas em modo texto e em stream.
     from src.llm_client import gerar_feedback_stream
     for token in gerar_feedback_stream(codigo, analise):
         yield token

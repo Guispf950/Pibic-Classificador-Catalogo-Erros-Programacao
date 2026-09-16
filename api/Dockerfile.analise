@@ -1,48 +1,38 @@
-# Dockerfile.analise — "molde" (imagem) do ambiente de análise isolado.
-# =====================================================================
-# Uma IMAGEM Docker é um sistema de arquivos congelado + instruções de execução.
-# Cada `docker run` cria um CONTÊINER (uma cópia viva e descartável) a partir dela.
-# Aqui montamos um Ubuntu com as ferramentas de análise dinâmica + Python, e
-# copiamos o SEU pacote `src/` para dentro. Assim a DETECÇÃO roda isolada, mas com
-# EXATAMENTE o mesmo código do orquestrador (paridade total).
+# Dockerfile.analise — imagem do ambiente de análise isolado.
+# Monta um Ubuntu com as ferramentas de análise dinâmica + Python e copia o pacote `src/` para
+# dentro, de modo que a DETECÇÃO rode isolada, mas com exatamente o mesmo código do orquestrador.
 #
-# IMPORTANTE — CONTEXTO DE BUILD:
-#   Este Dockerfile precisa copiar `src/` (que fica na RAIZ do projeto) e
-#   `api/runner_analise.py`. Por isso o build é feito A PARTIR DA RAIZ do projeto,
-#   apontando para este arquivo com -f:
-#
+# Contexto de build: precisa copiar `src/` (raiz do projeto) e `api/runner_analise.py`, então o
+# build é feito A PARTIR DA RAIZ, apontando este arquivo com -f:
 #     docker build -f api/Dockerfile.analise -t analise-mem:latest .
-#
-#   (o "." final é o contexto = a raiz do projeto; sem isso o COPY de src/ falha.)
+# (o "." final é o contexto = a raiz; sem isso o COPY de src/ falha.)
 
 FROM ubuntu:22.04
 
 # Ferramentas: gcc (compila C), gdb (Malha 1), valgrind (Malha 2), python3 (o runner).
-# libc6-dev é ESSENCIAL: traz os cabeçalhos da biblioteca padrão do C (stdio.h,
-# stdlib.h, ...). No Ubuntu ele é apenas RECOMENDADO por gcc; como usamos
-# --no-install-recommends, precisamos listá-lo à mão — senão o #include <stdio.h>
-# falha com "fatal error: stdio.h: No such file or directory".
+# libc6-dev é essencial: traz os cabeçalhos da libc (stdio.h, stdlib.h, ...). Como o gcc apenas o
+# RECOMENDA e usa-se --no-install-recommends, ele precisa ser listado à mão — senão o
+# #include <stdio.h> falha com "fatal error: stdio.h: No such file or directory".
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         gcc libc6-dev valgrind gdb libasan8 python3 && \
     rm -rf /var/lib/apt/lists/*
 
-# Copia o pacote de detecção (o SEU código) e o runner para dentro da imagem.
-# Só a DETECÇÃO entra aqui; llm_client/kb/cwe também vêm junto em src/, mas o runner
-# NÃO os importa (o LLM roda no host). Copiar src/ inteiro simplifica a manutenção:
-# a imagem espelha o seu src/.
+# Copia o pacote de detecção e o runner. Só a DETECÇÃO é usada aqui; llm_client/kb/cwe vêm junto
+# em src/, mas o runner não os importa (o LLM roda no host). Copiar src/ inteiro mantém a imagem
+# espelhando o src/ do projeto.
 COPY src/ /app/src/
 COPY api/runner_analise.py /app/runner_analise.py
 
-# Usuário SEM privilégios (uid 1000): o código do aluno nunca roda como root.
+# Usuário sem privilégios (uid 1000): o código do aluno nunca roda como root.
 RUN useradd -m -u 1000 sandbox
 USER sandbox
 
-# CWD writável em tempo de execução: o contêiner sobe com --read-only + --tmpfs /tmp,
-# então /tmp é o único lugar gravável. As malhas compilam ./bin_asan e ./bin_valgrind
-# relativos ao CWD — com WORKDIR /tmp, eles caem no tmpfs (ok).
+# CWD gravável em runtime: o contêiner sobe com --read-only + --tmpfs /tmp, então /tmp é o único
+# lugar gravável. As malhas compilam ./bin_asan e ./bin_valgrind relativos ao CWD — com
+# WORKDIR /tmp, caem no tmpfs.
 WORKDIR /tmp
 
-# ENTRYPOINT = o que roda quando o contêiner sobe. Recebe o caminho do .c como argumento
-# (passado pelo `docker run ... /work/<arquivo>` montado pelo sandbox.py).
+# ENTRYPOINT: roda quando o contêiner sobe. Recebe o caminho do .c como argumento (passado pelo
+# `docker run ... /work/<arquivo>` montado pelo sandbox.py).
 ENTRYPOINT ["python3", "/app/runner_analise.py"]
