@@ -1,0 +1,12 @@
+# Contexto de build da imagem de análise (docker build -f api/Dockerfile.analise .).
+# A imagem só copia src/ e api/runner_analise.py; o resto não precisa ir para o
+# daemon do Docker. Sem este arquivo, cada build enviaria também o dataset Juliet
+# (~464 MB), os ambientes virtuais e as saídas.
+.git
+**/.venv
+**/__pycache__
+data/
+output/
+experiments/
+docs/
+bin_*

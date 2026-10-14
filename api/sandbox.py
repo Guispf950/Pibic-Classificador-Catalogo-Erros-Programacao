@@ -1,16 +1,21 @@
 """
-sandbox.py — wrapper de sandbox em Docker para rodar a DETECÇÃO com segurança.
+sandbox.py — Wrapper de "sandbox" em Docker para rodar a DETECÇÃO com segurança.
+================================================================================
+POR QUE ISSO EXISTE:
+  O código do aluno é CÓDIGO NÃO CONFIÁVEL. Rodá-lo direto na máquina que hospeda a
+  API é perigoso. A solução padrão é executar cada submissão dentro de um "sandbox":
+  um ambiente ISOLADO e DESCARTÁVEL, com limites de recursos. Usamos um CONTÊINER
+  Docker por submissão — criado, usado e destruído (--rm).
 
-O código do aluno é NÃO CONFIÁVEL; rodá-lo direto na máquina que hospeda a API é perigoso. Cada
-submissão executa num contêiner Docker isolado e descartável (--rm), com limites de recursos.
+O QUE RODA AQUI DENTRO:
+  A DETECÇÃO (Malha 1 ASan+GDB e Malha 2 Valgrind), via runner_analise.py. O LLM
+  NÃO roda aqui (o contêiner tem --network none e não alcança o Ollama). A
+  classificação e o feedback acontecem no HOST (ver pipeline_adapter.py).
 
-Aqui roda só a DETECÇÃO (Malha 1 ASan+GDB e Malha 2 Valgrind), via runner_analise.py. O LLM não
-roda aqui (o contêiner usa --network none e não alcança o Ollama); classificação e feedback ficam
-no HOST (ver pipeline_adapter.py).
-
-Modos (variável MODO_SANDBOX): "docker" usa contêiner de verdade (precisa da imagem construída);
-qualquer outro valor é MOCK — não executa nada e devolve um resultado de exemplo (API testável
-sem Docker).
+MODOS (variável de ambiente MODO_SANDBOX):
+  • "docker" -> contêiner de verdade (precisa da imagem construída).
+  • qualquer outro valor -> modo MOCK: não executa nada, devolve um resultado de
+    exemplo (deixa a API testável sem Docker).
 """
 
 import os
@@ -21,7 +26,7 @@ import tempfile
 # "docker" = usa contêiner de verdade; qualquer outro valor = modo mock (sem executar).
 MODO_SANDBOX = os.environ.get("MODO_SANDBOX", "mock")
 IMAGEM = os.environ.get("IMAGEM_ANALISE", "analise-mem:latest")   # nome da imagem Docker
-TIMEOUT_S = int(os.environ.get("SANDBOX_TIMEOUT_S", "180"))        # teto (heurística de 3 min)
+TIMEOUT_S = int(os.environ.get("SANDBOX_TIMEOUT_S", "180"))        # teto (heurística de 3 min assim como no codebench)
 
 # Marcador que o runner_analise.py imprime antes do JSON de resultado (ver aquele arquivo).
 MARCADOR = "===RESULTADO_JSON==="

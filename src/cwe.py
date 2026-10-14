@@ -2,10 +2,26 @@
 Classificação do erro para CWE (Common Weakness Enumeration, do MITRE) — a lista do MITRE
 que cataloga fraquezas conhecidas de software.
 
-Mapeia, de forma DETERMINÍSTICA, o erro reportado pela ferramenta (ASan/Valgrind) para o
-CWE correspondente, por lookup de regex sobre o relatório — nunca por consulta ao LLM.
+Mapeia, de forma DETERMINÍSTICA, o erro reportado pela ferramenta (ASan/Valgrind/GDB) para o
+CWE correspondente, por regex sobre o relatório — nunca por consulta ao LLM.
 Assim mantém-se a essência determinística do pipeline, e o CWE serve também de checagem de
 consistência contra o diagnóstico.
+
+A classificação tem duas camadas, avaliadas numa ÚNICA sequência de prioridade (_PASSOS):
+  1. Regras simples: o NOME do erro no relatório decide o CWE (ex.: "double-free" -> CWE-415).
+  2. Refinamentos: leem DETALHES do relatório além do nome:
+     - acesso fora dos limites de um vetor: LEITURA x ESCRITA ("READ/WRITE of size N") e
+       ANTES do início x DEPOIS do fim -> CWE-121/122/124/126/127/787. O lado vem, nesta
+       ordem: da frase do heap/global ("to the left/right of", "before/after"); da fronteira
+       de variável da pilha mais próxima do acesso; do texto "underflows/overflows this
+       variable"; do byte marcado no mapa de memória-sombra (alloca/VLA); do nome do erro;
+     - segmentation fault: o ENDEREÇO da falha (impresso pelo GDB a partir de $_siginfo, ver
+       malha1_asan.py) separa ponteiro nulo, recursão sem fim, escrita em memória só-leitura
+       e ponteiro com lixo -> CWE-476/674/758/824.
+
+Os textos procurados foram conferidos no ambiente do sandbox (GCC 11.4, GDB 12.1,
+Valgrind 3.18.1). Versões novas do ASan trocaram "to the left/right of" por "before/after";
+as regras aceitam as duas formas.
 
 Fundamentação: catálogo CWE do MITRE (cwe.mitre.org) e o Juliet Test Suite / NIST SARD,
 benchmark de falhas em C/C++ rotulado por CWE.
@@ -14,60 +30,313 @@ benchmark de falhas em C/C++ rotulado por CWE.
 import re
 
 
-# Tabela (regex, CWE, nome), em ORDEM DE PRIORIDADE — a primeira regra que casa vence.
-# A ordem desambigua erros que compartilham marcadores no log (ex.: double-free e
-# use-after-free ambos citam "free'd"; as regras de liberação vêm antes por isso).
-_REGRAS_BRUTAS = [
-    # Liberação indevida (antes do use-after-free, que também cita "free'd")
-    (r"attempting double-free|\bdouble-free\b",                      "CWE-415", "Double Free"),
-    (r"attempting free on address which was not malloc",            "CWE-590", "Free of Memory not on the Heap"),
-    (r"Mismatched free",                                            "CWE-762", "Mismatched Memory Management Routines"),
-    (r"Invalid free",                                               "CWE-415", "Double Free"),  # genérico do Valgrind
-
-    # Uso de memória já liberada (ASan: "heap-use-after-free"; Valgrind: bloco "free'd")
-    (r"heap-use-after-free|free'd",                                 "CWE-416", "Use After Free"),
-
-    # Uso de variável local após o fim de vida dela
-    (r"stack-use-after-return",                                     "CWE-562", "Return of Stack Variable Address"),
-    (r"use-after-scope",                                            "CWE-825", "Expired Pointer Dereference"),
-
-    # Acesso fora dos limites de buffer (o ASan indica a localização)
-    (r"heap-buffer-overflow",                                       "CWE-122", "Heap-based Buffer Overflow"),
-    (r"stack-buffer-overflow",                                      "CWE-121", "Stack-based Buffer Overflow"),
-    (r"global-buffer-overflow",                                     "CWE-787", "Out-of-bounds Write"),
-
-    # Uso de valor não inicializado
-    (r"depends on uninitialised|Use of uninitialised value|uninitialized-value",
-                                                                    "CWE-457", "Use of Uninitialized Variable"),
-
-    # Vazamento de memória
-    (r"(?:definitely|indirectly) lost",                            "CWE-401", "Missing Release of Memory after Effective Lifetime"),
-
-    # Acesso inválido genérico do Valgrind (sem "free'd"): CWE pela direção do acesso
-    (r"Invalid write",                                             "CWE-787", "Out-of-bounds Write"),
-    (r"Invalid read",                                              "CWE-125", "Out-of-bounds Read"),
-
-    # Crash por sinal sem outra assinatura: em código de iniciante, quase sempre deref de NULL
-    (r"\bSEGV\b|Segmentation fault|null pointer",                  "CWE-476", "NULL Pointer Dereference"),
-]
-
-# Padrões pré-compilados (compilar é o passo caro; feito uma vez na carga do módulo).
-REGRAS_CWE = [(re.compile(rx, re.IGNORECASE), cid, nome) for (rx, cid, nome) in _REGRAS_BRUTAS]
+# Nome oficial (MITRE) de cada CWE que o pipeline pode devolver.
+_NOME = {
+    "CWE-121": "Stack-based Buffer Overflow",
+    "CWE-122": "Heap-based Buffer Overflow",
+    "CWE-124": "Buffer Underwrite ('Buffer Underflow')",
+    "CWE-125": "Out-of-bounds Read",
+    "CWE-126": "Buffer Over-read",
+    "CWE-127": "Buffer Under-read",
+    "CWE-190": "Integer Overflow or Wraparound",
+    "CWE-195": "Signed to Unsigned Conversion Error",
+    "CWE-369": "Divide By Zero",
+    "CWE-401": "Missing Release of Memory after Effective Lifetime",
+    "CWE-415": "Double Free",
+    "CWE-416": "Use After Free",
+    "CWE-457": "Use of Uninitialized Variable",
+    "CWE-475": "Undefined Behavior for Input to API",
+    "CWE-476": "NULL Pointer Dereference",
+    "CWE-562": "Return of Stack Variable Address",
+    "CWE-590": "Free of Memory not on the Heap",
+    "CWE-674": "Uncontrolled Recursion",
+    "CWE-758": "Reliance on Undefined, Unspecified, or Implementation-Defined Behavior",
+    "CWE-762": "Mismatched Memory Management Routines",
+    "CWE-787": "Out-of-bounds Write",
+    "CWE-789": "Memory Allocation with Excessive Size Value",
+    "CWE-824": "Access of Uninitialized Pointer",
+    "CWE-825": "Expired Pointer Dereference",
+}
 
 # Retorno quando o log não casa nenhuma classe conhecida (ex.: erro de compilação).
 SEM_CWE = ("-", "-")
 
 
+# ── Limiares do refinamento do segmentation fault ─────────────────────────────
+# Endereços abaixo de 4 KiB (a "página zero") são ponteiro NULL, puro ou somado a um
+# deslocamento pequeno de campo/índice (ex.: p->v[10] com p == NULL falha em 0x2c).
+LIMITE_PAGINA_ZERO = 0x1000
+# Recursão sem fim esgota a pilha: a falha acontece colada ao topo da pilha (medido: 8 bytes
+# abaixo do stack pointer). 64 KiB de folga cobre funções com variáveis locais grandes.
+JANELA_PILHA = 64 * 1024
+# si_code do SIGSEGV no Linux: 1 = endereço não mapeado; 2 = página existe mas sem permissão
+# (típico de escrever numa string literal, que fica em memória só-leitura).
+SEGV_ACCERR = 2
+# 128 = SI_KERNEL: o processador recusou o endereço por ser "não canônico" (lixo absurdo, como
+# 0x973b24f271683000) e o kernel informa addr=0. Sem este caso, um ponteiro com lixo seria
+# confundido com NULL (medido na submissao_5303358.c).
+SI_KERNEL = 128
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. REGRAS SIMPLES: o nome do erro decide o CWE
+# ══════════════════════════════════════════════════════════════════════════════
+_RX_DOUBLE_FREE    = re.compile(r"attempting double-free|\bdouble-free\b", re.I)
+_RX_FREE_FORA_HEAP = re.compile(r"attempting free on address which was not malloc", re.I)
+_RX_MISMATCHED     = re.compile(r"Mismatched free", re.I)
+_RX_INVALID_FREE   = re.compile(r"Invalid free", re.I)      # genérico do Valgrind
+# Uso de memória já liberada (ASan: "heap-use-after-free"; Valgrind: "Address 0x... is 0 bytes
+# inside a block of size 40 free'd"). Exige "block of size N free'd": um "free'd" solto também
+# aparece em "Address 0x0 is not stack'd, malloc'd or (recently) free'd" (ponteiro NULL ou com
+# lixo no Valgrind), que antes era rotulado, errado, como use-after-free.
+_RX_USE_AFTER_FREE = re.compile(r"heap-use-after-free|block of size \d+ free'd", re.I)
+# Uso de variável local após o fim de vida dela.
+_RX_AFTER_RETURN   = re.compile(r"stack-use-after-return", re.I)
+_RX_AFTER_SCOPE    = re.compile(r"use-after-scope", re.I)
+# Recursão sem fim reportada diretamente pela ferramenta (fora do GDB).
+_RX_RECURSAO       = re.compile(r"AddressSanitizer: stack-overflow|Stack overflow in thread", re.I)
+# Pedido de alocação absurdo (ex.: malloc(n) com n lido errado / lixo).
+_RX_ALOCACAO_ABSURDA = re.compile(r"allocation-size-too-big|requested allocation size", re.I)
+# Cópia entre áreas de memória sobrepostas (strcpy(s, s+1), memcpy com overlap).
+_RX_SOBREPOSICAO   = re.compile(r"-param-overlap|Source and destination overlap", re.I)
+# Tamanho negativo passado a memcpy/memset (int negativo virando size_t gigante).
+_RX_TAMANHO_NEGATIVO = re.compile(r"negative-size-param", re.I)
+# O cálculo do tamanho da alocação estourou (count * size não cabe em size_t).
+_RX_CALCULO_TAMANHO = re.compile(
+    r"calloc-overflow|calloc parameters overflow|reallocarray-overflow|reallocarray parameters overflow",
+    re.I)
+# Uso de valor não inicializado (incl. passado ao sistema: "Syscall param write(buf) points
+# to uninitialised byte(s)", que aparece ao imprimir um vetor nunca preenchido).
+_RX_NAO_INICIALIZADO = re.compile(
+    r"depends on uninitialised|Use of uninitialised value|uninitialised byte|uninitialized-value", re.I)
+# Vazamento: só a linha de REGISTRO de perda ("N bytes in M blocks are definitely lost in
+# loss record ..."). O resumo "definitely lost: 0 bytes in 0 blocks" NÃO pode casar — antes
+# casava e rotulava vazamento em programas sem vazamento. "possibly lost" também é vazamento
+# (ponteiro só para o meio do bloco) e o Valgrind já o conta como erro por padrão.
+_RX_VAZAMENTO      = re.compile(r"blocks are (?:definitely|indirectly|possibly) lost", re.I)
+# Divisão por zero: GDB ("SIGFPE, Arithmetic exception"), ASan ("FPE on unknown address")
+# e Valgrind ("Integer divide by zero" / "signal 8 (SIGFPE)").
+_RX_DIVISAO_ZERO   = re.compile(
+    r"received signal SIGFPE|\bFPE on unknown address|signal 8 \(SIGFPE\)|Integer divide by zero"
+    r"|Arithmetic exception", re.I)
+
+
+def _regra(rx, cwe_id):
+    """Passo simples: devolve cwe_id se o padrão aparece no log, senão None."""
+    return lambda log: cwe_id if rx.search(log) else None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. REFINAMENTO: acesso fora dos limites de um vetor
+# ══════════════════════════════════════════════════════════════════════════════
+# Nome do erro no ASan: região (heap/pilha/global/VLA) + overflow (depois do fim) ou
+# underflow (antes do início). O ASan só usa "underflow" para variáveis de PILHA; no heap e no
+# global o lado vem numa linha à parte.
+_RX_ESTOURO_ASAN = re.compile(r"\b(heap|stack|global|dynamic-stack)-buffer-(overflow|underflow)\b", re.I)
+_RX_ACESSO       = re.compile(r"\b(READ|WRITE) of size \d+")
+# Heap e global: "0x... is located 4 bytes to the left of 40-byte region" (ASan antigo, o do
+# sandbox) ou "... 4 bytes before ..." (ASan novo).
+_RX_LADO_ASAN    = re.compile(r"is located \d+ bytes (?:to the )?(left|right|before|after)\b", re.I)
+# Pilha: o ASan lista as variáveis da função ("[48, 148) 'dest'") e o deslocamento do acesso
+# ("Memory access at offset 148"). O texto "underflows/overflows this variable" é relativo a
+# UMA variável e pode apontar a vizinha errada: lendo `dest` além do fim, o ASan escreveu
+# "partially underflows" da variável seguinte (Juliet CWE126 ..._CWE170_char_loop_01). Por isso
+# o lado é decidido pela fronteira de variável MAIS PRÓXIMA do acesso; o texto fica de reserva.
+_RX_VAR_PILHA    = re.compile(r"\[(\d+), (\d+)\) '[^']*'")
+_RX_OFFSET_PILHA = re.compile(r"Memory access at offset (\d+)")
+_RX_LADO_PILHA   = re.compile(r"\b(underflows|overflows) this variable", re.I)
+# Vetor de tamanho dinâmico na pilha (alloca/VLA): o ASan não escreve o lado, mas marca no mapa
+# de memória-sombra o byte onde o acesso caiu: "=>0x...: ca ca ca[ca]00 00 ...". Zonas
+# proibidas: ca = à esquerda do alloca, cb = à direita; f1 = à esquerda da pilha, f3 = à direita.
+_RX_BYTE_SOMBRA  = re.compile(r"^=>0x[0-9a-fA-F]+:[^\[\n]*\[([0-9a-fA-F]{2})\]", re.M)
+_SOMBRA_ANTES    = {"ca", "f1"}
+_SOMBRA_DEPOIS   = {"cb", "f3"}
+# Valgrind (só vê o heap): "Address 0x... is 4 bytes before a block of size 40 alloc'd".
+_RX_LADO_VALGRIND = re.compile(r"is \d+ bytes (before|after) a block of size \d+ alloc'd", re.I)
+_RX_INVALIDO_VALGRIND = re.compile(r"Invalid (read|write) of size \d+", re.I)
+# Valgrind, endereço fora de qualquer bloco: "Address 0x0 is not stack'd, malloc'd or (recently) free'd".
+_RX_ENDERECO_SOLTO = re.compile(r"Address (0x[0-9a-fA-F]+) is not stack'd, malloc'd or \(recently\) free'd")
+
+
+def _cwe_por_limites(regiao, acesso, lado):
+    """
+    Combina leitura/escrita com antes/depois:
+        ESCRITA antes do início -> CWE-124 (Buffer Underwrite)
+        LEITURA antes do início -> CWE-127 (Buffer Under-read)
+        LEITURA depois do fim   -> CWE-126 (Buffer Over-read)
+        ESCRITA depois do fim   -> pela região: heap 122, pilha 121, global 787
+    Sem a informação de acesso (não deveria acontecer), mantém o CWE da região.
+    """
+    if acesso == "WRITE" and lado == "antes":
+        return "CWE-124"
+    if acesso == "READ" and lado == "antes":
+        return "CWE-127"
+    if acesso == "READ":
+        return "CWE-126"
+    return {"heap": "CWE-122", "stack": "CWE-121", "dynamic-stack": "CWE-121"}.get(regiao, "CWE-787")
+
+
+def _lado_pela_pilha(log):
+    """'antes'/'depois' pela fronteira de variável mais próxima do acesso; None se não der."""
+    m = _RX_OFFSET_PILHA.search(log)
+    if not m:
+        return None
+    deslocamento = int(m.group(1))
+    melhor = None                                   # (distância, lado)
+    for inicio, fim in ((int(a), int(b)) for a, b in _RX_VAR_PILHA.findall(log)):
+        if deslocamento >= fim:
+            candidato = (deslocamento - fim, "depois")
+        elif deslocamento < inicio:
+            candidato = (inicio - deslocamento, "antes")
+        else:
+            continue                                # começa dentro da variável: sem pista aqui
+        if melhor is None or candidato[0] < melhor[0]:
+            melhor = candidato
+    return melhor[1] if melhor else None
+
+
+def _classificar_estouro_asan(log):
+    m = _RX_ESTOURO_ASAN.search(log)
+    if not m:
+        return None
+    regiao, tipo = m.group(1).lower(), m.group(2).lower()
+    acesso = _RX_ACESSO.search(log)
+    acesso = acesso.group(1) if acesso else None
+    lado = _RX_LADO_ASAN.search(log)
+    if lado:
+        lado = "antes" if lado.group(1).lower() in ("left", "before") else "depois"
+    elif _lado_pela_pilha(log):
+        lado = _lado_pela_pilha(log)
+    else:
+        lado = _RX_LADO_PILHA.search(log)
+        if lado:
+            lado = "antes" if lado.group(1).lower() == "underflows" else "depois"
+        else:
+            sombra = _RX_BYTE_SOMBRA.search(log)
+            sombra = sombra.group(1).lower() if sombra else ""
+            if sombra in _SOMBRA_ANTES:
+                lado = "antes"
+            elif sombra in _SOMBRA_DEPOIS:
+                lado = "depois"
+            else:
+                # Sem nenhuma pista de posição: o próprio nome do erro diz o lado.
+                lado = "antes" if tipo == "underflow" else "depois"
+    return _cwe_por_limites(regiao, acesso, lado)
+
+
+def _classificar_invalido_valgrind(log):
+    m = _RX_INVALIDO_VALGRIND.search(log)
+    if not m:
+        return None
+    acesso = "READ" if m.group(1).lower() == "read" else "WRITE"
+    resto = log[m.end():]                    # as linhas "Address ..." vêm logo depois do erro
+    bloco = _RX_LADO_VALGRIND.search(resto)
+    if bloco:
+        lado = "antes" if bloco.group(1).lower() == "before" else "depois"
+        return _cwe_por_limites("heap", acesso, lado)
+    solto = _RX_ENDERECO_SOLTO.search(resto)
+    if solto:
+        return "CWE-476" if int(solto.group(1), 16) < LIMITE_PAGINA_ZERO else "CWE-824"
+    # Sem detalhe de posição: classificação genérica pela direção do acesso.
+    return "CWE-787" if acesso == "WRITE" else "CWE-125"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. REFINAMENTO: segmentation fault
+# ══════════════════════════════════════════════════════════════════════════════
+# Sob o GDB o sinal chega ao GDB ANTES do ASan, então o relatório do ASan não aparece; a
+# Malha 1 pede ao GDB uma linha própria com o endereço da falha, o código do sinal e o topo
+# da pilha: "PIPELINE_SIGINFO addr=0x2c code=1 sp=0x7fffffffebd0" (NULL aparece como "(nil)").
+_RX_SEGFAULT = re.compile(
+    r"received signal SIGSEGV|\bSEGV on unknown address|signal 11 \(SIGSEGV\)|Segmentation fault"
+    r"|null pointer", re.I)
+_RX_SIGINFO = re.compile(r"PIPELINE_SIGINFO addr=(\(nil\)|0x[0-9a-fA-F]+) code=(-?\d+) sp=(\(nil\)|0x[0-9a-fA-F]+)")
+_RX_FAIXA_VALGRIND = re.compile(
+    r"(Access not within mapped region|Bad permissions for mapped region) at address (0x[0-9a-fA-F]+)")
+_RX_SEGV_ASAN = re.compile(r"SEGV on unknown address (0x[0-9a-fA-F]+)")
+
+
+def _endereco(texto):
+    return 0 if texto == "(nil)" else int(texto, 16)
+
+
+def _classificar_segfault(log):
+    if not _RX_SEGFAULT.search(log):
+        return None
+
+    info = _RX_SIGINFO.search(log)
+    if info:
+        endereco, codigo, topo = _endereco(info.group(1)), int(info.group(2)), _endereco(info.group(3))
+        if topo and abs(endereco - topo) <= JANELA_PILHA:
+            return "CWE-674"        # falha colada ao topo da pilha: recursão sem fim
+        if codigo == SI_KERNEL:
+            return "CWE-824"        # endereço não canônico: ponteiro com lixo (kernel diz addr=0)
+        if endereco < LIMITE_PAGINA_ZERO:
+            return "CWE-476"        # ponteiro NULL (puro ou + deslocamento pequeno)
+        if codigo == SEGV_ACCERR:
+            return "CWE-758"        # escrita em memória só-leitura (ex.: string literal)
+        return "CWE-824"            # endereço não nulo e não mapeado: ponteiro com lixo
+
+    faixa = _RX_FAIXA_VALGRIND.search(log)
+    if faixa:
+        if _endereco(faixa.group(2)) < LIMITE_PAGINA_ZERO:
+            return "CWE-476"
+        return "CWE-758" if faixa.group(1).startswith("Bad permissions") else "CWE-824"
+
+    asan = _RX_SEGV_ASAN.search(log)
+    if asan:
+        return "CWE-476" if _endereco(asan.group(1)) < LIMITE_PAGINA_ZERO else "CWE-824"
+
+    # Sem nenhum endereço no log: mantém o comportamento anterior (deref de NULL, o caso mais
+    # comum em código de iniciante).
+    return "CWE-476"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEQUÊNCIA DE PRIORIDADE — o primeiro passo que reconhece o log vence.
+# ══════════════════════════════════════════════════════════════════════════════
+# A ordem desambigua erros que compartilham marcadores no log (ex.: double-free e
+# use-after-free ambos citam "free'd"; as regras de liberação vêm antes por isso). Os erros
+# nomeados explicitamente pela ferramenta vêm antes dos sinais genéricos (SIGFPE/SIGSEGV).
+_PASSOS = [
+    # Liberação indevida (antes do use-after-free, que também cita "free'd")
+    _regra(_RX_DOUBLE_FREE, "CWE-415"),
+    _regra(_RX_FREE_FORA_HEAP, "CWE-590"),
+    _regra(_RX_MISMATCHED, "CWE-762"),
+    _regra(_RX_INVALID_FREE, "CWE-415"),
+    # Uso de memória já liberada / variável local fora do tempo de vida
+    _regra(_RX_USE_AFTER_FREE, "CWE-416"),
+    _regra(_RX_AFTER_RETURN, "CWE-562"),
+    _regra(_RX_AFTER_SCOPE, "CWE-825"),
+    # Acesso fora dos limites (ASan): leitura/escrita x antes/depois
+    _classificar_estouro_asan,
+    # Outros erros nomeados pelo ASan
+    _regra(_RX_RECURSAO, "CWE-674"),
+    _regra(_RX_ALOCACAO_ABSURDA, "CWE-789"),
+    _regra(_RX_SOBREPOSICAO, "CWE-475"),
+    _regra(_RX_TAMANHO_NEGATIVO, "CWE-195"),
+    _regra(_RX_CALCULO_TAMANHO, "CWE-190"),
+    # Valgrind
+    _regra(_RX_NAO_INICIALIZADO, "CWE-457"),
+    _regra(_RX_VAZAMENTO, "CWE-401"),
+    _classificar_invalido_valgrind,
+    # Crash por sinal (o GDB pega antes do ASan)
+    _regra(_RX_DIVISAO_ZERO, "CWE-369"),
+    _classificar_segfault,
+]
+
+
 def classificar_cwe(log):
     """
     Devolve (cwe_id, cwe_nome) a partir do relatório da ferramenta, ou ('-', '-').
-    Percorre as regras em ordem e retorna o CWE da primeira cujo padrão aparece no log.
+    Percorre os passos em ordem e retorna o CWE do primeiro que reconhece o log.
     """
     if not log:
         return SEM_CWE
-    for rx, cid, nome in REGRAS_CWE:
-        if rx.search(log):
-            return (cid, nome)
+    for passo in _PASSOS:
+        cwe_id = passo(log)
+        if cwe_id:
+            return (cwe_id, _NOME[cwe_id])
     return SEM_CWE
 
 
@@ -83,10 +352,21 @@ _TIPO_POR_CWE = {
     "CWE-122": "heap-buffer-overflow",
     "CWE-121": "stack-buffer-overflow",
     "CWE-787": "out-of-bounds-write",
+    "CWE-124": "buffer-underwrite",
+    "CWE-126": "buffer-over-read",
+    "CWE-127": "buffer-under-read",
+    "CWE-125": "out-of-bounds-read",
     "CWE-457": "uninitialized-value",
     "CWE-401": "memory-leak",
-    "CWE-125": "out-of-bounds-read",
     "CWE-476": "null-pointer-dereference",
+    "CWE-824": "invalid-pointer-dereference",
+    "CWE-758": "write-to-read-only-memory",
+    "CWE-674": "uncontrolled-recursion",
+    "CWE-369": "division-by-zero",
+    "CWE-789": "excessive-allocation-size",
+    "CWE-475": "overlapping-memory-copy",
+    "CWE-195": "negative-size-argument",
+    "CWE-190": "allocation-size-overflow",
 }
 
 

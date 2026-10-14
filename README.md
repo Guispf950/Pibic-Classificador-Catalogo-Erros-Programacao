@@ -79,8 +79,9 @@ a marcação é determinística e dispensa o *fuzzy matching* que o FLAME precis
   diagnóstico + feedback de cada uma. É o modo de pesquisa/avaliação em lote.
 - **API** (`api/`): expõe o mesmo pipeline como serviço FastAPI para o CodeBench, com a
   **detecção isolada em contêiner Docker** (código não confiável) e o **LLM rodando no host**.
-  Dois endpoints: `/analisar` (JSON, diagnóstico imediato) e `/feedback` (streaming SSE, o
-  feedback "sendo digitado"). Ver `api/README.md`.
+  Segue convenções REST (recursos no plural, versão `/v1`): `POST /v1/diagnostics` (JSON,
+  diagnóstico imediato) e `POST /v1/feedbacks` (streaming SSE + persistência do feedback). Ver
+  `api/README.md`.
 
 ## Estrutura do repositório
 

@@ -1,29 +1,49 @@
 # Serviço FastAPI — análise e feedback
 
-Serviço que expõe o pipeline como uma **API separada**, chamada pelo CodeBench.
-Dois endpoints: `/analisar` (JSON) e `/feedback` (streaming SSE).
+Serviço que expõe o pipeline como uma **API separada**, chamada pelo CodeBench. Segue convenções
+REST: recursos no plural, versão no caminho (`/v1`) e a ação expressa pelo método HTTP.
+
+## Endpoints
+
+| Método + caminho | Papel |
+|---|---|
+| `POST /v1/diagnostics` | Diagnóstico determinístico do erro (JSON). Aceita o código em **JSON** ou como **arquivo** (multipart). |
+| `POST /v1/feedbacks` | Gera o feedback ao aluno em **streaming (SSE)**, **persiste** o resultado e devolve **201** com o `id` no header `Location`. Mesmos dois formatos de entrada. |
+| `GET /v1/feedbacks` | Lista os feedbacks persistidos (resumo) — base para avaliação posterior. |
+| `GET /v1/feedbacks/{id}` | Recupera um feedback persistido (**404** se não existir). |
+| `GET /v1/health` | Checagem de saúde do serviço. |
+| `GET /teste` | Página HTML de teste do streaming (uso em demonstrações). |
+
+> **Um endpoint por recurso, dois formatos de entrada.** `/v1/diagnostics` e `/v1/feedbacks`
+> aceitam tanto `application/json` (`{codigo, entrada, nome_arquivo}`) quanto
+> `multipart/form-data` (campos `codigo` e `entrada`) — o servidor decide pelo `Content-Type`.
+> Não há mais endpoints separados por formato. **`codigo` e `entrada` são obrigatórios**: a
+> `entrada` é o caso de teste que exercita a análise dinâmica (só pode ser vazia se o programa
+> não lê stdin). Campo obrigatório ausente → `422`.
 
 ## Arquitetura (modo real)
 
 ```
                  HOST (a API)                         CONTÊINER (descartável, --network none)
   ┌───────────────────────────────────┐          ┌──────────────────────────────────────┐
-  │ POST /analisar                     │          │ runner_analise.py                    │
+  │ POST /v1/diagnostics               │          │ runner_analise.py                    │
   │   pipeline_adapter.analisar()      │  docker  │   Malha 1 (ASan+GDB)                 │
   │     └─ sandbox.rodar_em_sandbox() ─┼──run────▶│   Malha 2 (Valgrind)  → log do erro  │
   │     └─ src.llm_client.classificar  │◀─JSON────┤   limpar_log_gdb()                   │
   │        _erro()   (Ollama, no host) │          └──────────────────────────────────────┘
-  │ POST /feedback                     │
+  │ POST /v1/feedbacks                 │
   │   gerar_feedback_stream() (Ollama) │   A DETECÇÃO (código não confiável) roda isolada.
-  └───────────────────────────────────┘   O LLM roda no HOST (o contêiner não tem rede).
+  │   + feedback_store.salvar()        │   O LLM roda no HOST (o contêiner não tem rede).
+  └───────────────────────────────────┘
 ```
 
 ## Arquivos
 
 | Arquivo | Papel |
 |---|---|
-| `app.py` | A API FastAPI: os dois endpoints e o formato SSE. |
+| `app.py` | A API FastAPI: os endpoints REST e o formato SSE. |
 | `pipeline_adapter.py` | Cola entre a API e o pipeline. Modo **mock** (padrão) ou **real**. |
+| `feedback_store.py` | Persistência dos feedbacks gerados (JSON por feedback, em `output/feedbacks_api/`). |
 | `sandbox.py` | Wrapper que roda a **detecção** isolada em um contêiner Docker. |
 | `runner_analise.py` | Roda DENTRO do contêiner: chama Malha 1/2 + limpa o log, emite JSON. |
 | `Dockerfile.analise` | "Molde" (imagem): Ubuntu + gcc + gdb + valgrind + python3 + cópia de `src/`. |
@@ -40,7 +60,7 @@ uvicorn app:app --reload
 ```
 - Doc automática: http://127.0.0.1:8000/docs
 - Página de teste do SSE: http://127.0.0.1:8000/teste
-- `/saude` deve retornar `{"ok": true, "pipeline_real": false}`.
+- `/v1/health` deve retornar `{"ok": true, "pipeline_real": false}`.
 
 ## 2) Ligar o pipeline REAL
 
@@ -57,24 +77,36 @@ Rodar da raiz é importante: é de lá que `./base_conhecimento` (a KB) resolve.
 USAR_PIPELINE_REAL=1 MODO_SANDBOX=docker IMAGEM_ANALISE=analise-mem:latest \
   uvicorn api.app:app --reload
 ```
-- `/saude` deve retornar `{"ok": true, "pipeline_real": true}`.
+- `/v1/health` deve retornar `{"ok": true, "pipeline_real": true}`.
 - O Ollama precisa estar acessível pelo HOST no endereço de `src/config.py`
   (`URL_LLM_LOCAL`). Teste antes: `curl http://192.168.0.105:11434/api/tags`.
 
 ## Testar
 
-`/analisar` (POST JSON) — Insomnia/Postman/curl:
+`POST /v1/diagnostics` (JSON) — Insomnia/Postman/curl:
 ```
-curl -X POST http://127.0.0.1:8000/analisar \
+curl -X POST http://127.0.0.1:8000/v1/diagnostics \
   -H "Content-Type: application/json" \
   -d '{"codigo":"int main(){int *p=0;return *p;}","entrada":"","nome_arquivo":"submissao.c"}'
 ```
 
-`/feedback` (SSE) — use `curl -N` (o `-N` mostra os tokens chegando), ou a página `/teste`:
+`POST /v1/diagnostics` (multipart — o MESMO endpoint, enviando arquivos):
 ```
-curl -N -X POST http://127.0.0.1:8000/feedback \
+curl -X POST http://127.0.0.1:8000/v1/diagnostics \
+  -F "codigo=@submissao.c" -F "entrada=@submissao.in"
+```
+
+`POST /v1/feedbacks` (SSE) — use `curl -N` (mostra os tokens chegando), ou a página `/teste`:
+```
+curl -N -X POST http://127.0.0.1:8000/v1/feedbacks \
   -H "Content-Type: application/json" \
   -d '{"codigo":"...","entrada":"","nome_arquivo":"submissao.c"}'
+```
+
+Recuperar os feedbacks persistidos (para avaliação posterior):
+```
+curl http://127.0.0.1:8000/v1/feedbacks            # lista (resumo)
+curl http://127.0.0.1:8000/v1/feedbacks/<id>       # um feedback completo
 ```
 
 ## Variáveis de ambiente
@@ -102,7 +134,7 @@ curl -N -X POST http://127.0.0.1:8000/feedback \
 
 ## Entrada (caso de teste) — como funciona
 
-A `entrada` enviada na requisição (`/analisar` e `/feedback`) é **autoritativa**: o
+A `entrada` enviada na requisição (`/v1/diagnostics` e `/v1/feedbacks`) é **autoritativa**: o
 `sandbox.py` a grava em `entrada.in` no diretório montado, o `runner_analise.py` a lê de
 `/work/entrada.in` e a repassa às malhas como stdin (mesmo vazia). A heurística antiga de
 adivinhar o stdin **não é usada** no caminho da API — a entrada vem sempre com o código.
@@ -110,10 +142,28 @@ adivinhar o stdin **não é usada** no caminho da API — a entrada vem sempre c
 
 ## Diagnóstico rápido vs. feedback detalhado
 
-- `/analisar` -> **100% determinístico** (sem LLM): `tipo_erro`, `cwe_id`, `cwe_nome`,
-  `linha_sintoma`, `linha_causa`, `evidencia_log`, `codigo_anotado`. Resposta imediata.
-- `/feedback` -> roda o mesmo diagnóstico determinístico e, **em seguida**, o passo com
-  LLM (streaming) para o feedback socrático. É o que o aluno pede quando quer mais detalhe.
+- `POST /v1/diagnostics` -> **100% determinístico** (sem LLM): `tipo_erro`, `cwe_id`, `cwe_nome`,
+  `linha_sintoma`, `linha_causa`, `evidencia_log`. Resposta imediata. (O `codigo_anotado` é
+  interno e **não** é devolvido ao cliente, para não vazar a localização exata do erro.)
+- `POST /v1/feedbacks` -> roda o mesmo diagnóstico determinístico e, **em seguida**, o passo com
+  LLM (streaming) para o feedback socrático, persistindo o resultado.
+
+## Persistência dos feedbacks
+
+Cada feedback gerado por `POST /v1/feedbacks` é salvo como um JSON em `output/feedbacks_api/`,
+com o diagnóstico (CWE, tipo, linhas), o código, o texto completo, o modelo e o modo de anotação.
+O objetivo é permitir a **avaliação posterior da qualidade pedagógica**. O `id` volta no header
+`Location` da resposta e nos eventos SSE; a coleção é navegável por `GET /v1/feedbacks`.
+
+## Códigos de status
+
+- `200` — diagnóstico devolvido; `GET` de feedback bem-sucedido.
+- `201` — feedback criado (POST /v1/feedbacks), com `Location: /v1/feedbacks/{id}`.
+- `404` — feedback inexistente em `GET /v1/feedbacks/{id}`.
+- `415` — `Content-Type` não suportado (use JSON ou multipart).
+- `422` — corpo inválido (validação do Pydantic).
+- `503` — dependência de análise indisponível (Docker/runner). Um **erro no código do aluno**
+  não é erro de API: retorna `200`/`201` com o erro descrito no corpo/stream.
 
 ## Pendência a confirmar (não assumida)
 

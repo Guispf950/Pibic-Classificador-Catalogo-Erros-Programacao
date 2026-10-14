@@ -56,9 +56,16 @@ def limpar_log_gdb(log_bruto, nome_arquivo):
             # ASan
             "ERROR:", "heap-buffer-overflow", "stack-buffer-overflow", "use-after-free",
             "use-after-return", "double-free", "SEGV",
+            "buffer-underflow", "this variable",      # pilha: "... underflows this variable"
+            # GDB: o sinal que derrubou o programa (SIGFPE, SIGSEGV...) e o endereço da falha
+            # que a Malha 1 pede ao GDB (ver malha1_asan.COMANDO_SIGINFO).
+            "received signal", "PIPELINE_SIGINFO",
             # Valgrind
-            "Conditional jump", "definitely lost", "indirectly lost", "Invalid",
+            "Conditional jump", "definitely lost", "indirectly lost", "possibly lost", "Invalid",
             "Mismatched free", "Uninitialized", "uninitialised", "use-after-scope",
+            "Source and destination overlap", "is not stack'd", "Process terminating",
+            "Integer divide by zero", "Stack overflow in thread",
+            "Access not within mapped region", "Bad permissions for mapped region",
             # Origem / causa raiz (linhas das flags --track-origins / --keep-stacktraces)
             "Uninitialised", "was created by", "Block was alloc'd", "a block of size",
             "declared at", "is located",

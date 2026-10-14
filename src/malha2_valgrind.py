@@ -154,7 +154,7 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", en
         stdin=subprocess.PIPE if stdin_analise else None,
         stderr=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
-        text=True
+        text=True, errors="replace"
     )
 
     # Injeta o stdin logo após o lançamento; close() sinaliza EOF ao binário.
@@ -191,7 +191,7 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", en
             "-ex", "quit",
             binario_saida
         ]
-        execucao_gdb = subprocess.run(comando_gdb, capture_output=True, text=True)
+        execucao_gdb = subprocess.run(comando_gdb, capture_output=True, text=True, errors="replace")
         saida_gdb = execucao_gdb.stdout + execucao_gdb.stderr
 
         # Após o kill, o Valgrind finaliza e imprime o resto do relatório: aguarda-se o processo e

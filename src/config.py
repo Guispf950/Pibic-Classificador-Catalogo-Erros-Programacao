@@ -11,6 +11,7 @@ PASTA_CODIGOS = "./data/submissoes_CE_codebench"          # submissões a analis
 ARQUIVO_CSV_SAIDA = "./output/catalogo_erros_codebench.csv"
 PASTA_ANOTADOS = "./output/codigos_anotados"              # códigos com anotação // @@
 PASTA_FEEDBACKS = "./output/feedbacks"                    # um .txt por submissão com erro
+PASTA_FEEDBACKS_API = "./output/feedbacks_api"           # um JSON por feedback gerado pela API (avaliação posterior)
 PASTA_KB = "./base_conhecimento"                          # um documento por CWE
 
 
@@ -20,7 +21,7 @@ MALHA_3_ATIVA = False
 
 
 # ── LLM local (Ollama) ──
-URL_LLM_LOCAL = "http://192.168.0.105:11434/api/generate"
+URL_LLM_LOCAL = os.environ.get("URL_LLM_LOCAL", "http://192.168.0.105:11434/api/generate")
 NOME_MODELO = "qwen2.5-coder:7b"
 
 # Timeout generoso: a 1ª chamada carrega o modelo na memória (cold start).

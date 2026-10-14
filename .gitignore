@@ -25,3 +25,9 @@ Thumbs.db
 
 # NOTA: as submissões dos alunos (codigos_alunos/) SÃO versionadas de propósito
 # (repositório privado). Não há regra ignorando-as.
+
+# ─── Datasets de terceiros (grandes, ficam só na máquina) ─────────────────
+# Juliet Test Suite C/C++ v1.3 (NIST SARD): ~146 MB zipado, ~464 MB / 106 mil arquivos
+# extraído. Nunca vai para o GitHub; só o README de procedência é versionado.
+data/juliet/*
+!data/juliet/README.md

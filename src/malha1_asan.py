@@ -22,6 +22,22 @@ from src.deteccao_entrada import stdin_para_analise
 # (SIGABRT entra aqui por ser o que o ASan usa ao abortar.)
 _SINAIS_FATAIS = ("SIGSEGV", "SIGABRT", "SIGFPE", "SIGBUS", "SIGILL", "SIGSYS", "SIGTRAP")
 
+# Profundidade máxima do backtrace (só os frames mais internos). Numa recursão sem fim o
+# "bt full" sem limite despejava ~100 mil frames (8 MB de log, 30 s — medido no sandbox),
+# estourando o tempo e inundando o prompt do LLM. Num erro normal são ~11 frames (ASan
+# incluso), então 50 não corta nada útil.
+MAX_FRAMES_BT = 50
+
+# Como o sinal chega ao GDB antes do ASan, num segmentation fault o log só diria "SIGSEGV",
+# sem dizer ONDE na memória foi a falha. Esta linha pede ao GDB o endereço da falha, o código
+# do sinal (1 = endereço não mapeado, 2 = sem permissão) e o topo da pilha. O cwe.py usa os
+# três para separar ponteiro nulo (endereço ~0), recursão sem fim (falha colada ao topo da
+# pilha), escrita em string literal (código 2) e ponteiro com lixo (o resto).
+COMANDO_SIGINFO = (
+    'printf "PIPELINE_SIGINFO addr=%p code=%d sp=%p\\n", '
+    '$_siginfo._sifields._sigfault.si_addr, $_siginfo.si_code, $sp'
+)
+
 
 def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=None):
     """
@@ -47,7 +63,7 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=No
          "-fno-omit-frame-pointer",
          "-g", caminho_codigo, "-o", binario_saida],
         capture_output=True,
-        text=True
+        text=True, errors="replace"
     )
 
     # Falha de compilação: nada a executar. tipo="compilacao" marca uma categoria própria
@@ -69,6 +85,7 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=No
     #   sob debugger. Leaks ficam com a Malha 2 (Valgrind+vgdb), que cobre leaks indiretos
     #   (ex.: nós internos de lista) e permite pausar no ponto do leak e inspecionar variáveis,
     #   gerando log mais rico do que o stack trace simples do LSan.
+    # (detect_stack_use_after_return NÃO entra aqui — ver FASE 5.)
     env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0"
 
     # --- FASE 3: EXECUÇÃO VIA GDB (ANÁLISE POST-MORTEM) ---
@@ -76,7 +93,8 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=No
         "gdb", "-q",        # modo silencioso
         "--batch",          # roda os comandos e sai
         "-ex", "run",       # inicia a execução
-        "-ex", "bt full",   # backtrace completo com variáveis locais de cada frame
+        "-ex", f"bt full {MAX_FRAMES_BT}",  # backtrace com variáveis locais (frames mais internos)
+        "-ex", COMANDO_SIGINFO,             # endereço da falha (ver COMANDO_SIGINFO)
         "-ex", "quit",
         binario_saida
     ]
@@ -93,7 +111,10 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=No
         comando_gdb,
         env=env,
         capture_output=True,
-        text=True,
+        # errors="replace": o programa do aluno pode imprimir bytes que não são texto válido
+        # (ex.: um vetor de char nunca preenchido). Sem isso a leitura da saída quebrava com
+        # UnicodeDecodeError e a análise inteira caía como "erro interno" (medido).
+        text=True, errors="replace",
         input=stdin_analise,   # None = sem input; string = injetado via pipe (ex.: "5\n1 2 3 4 5\n")
         timeout=60             # segurança contra travamento indefinido
     )
@@ -124,6 +145,31 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=No
             "erro": f"Crash por {sinal} capturado via GDB",
             "sinal": sinal,
             "log": saida_completa,
+        }
+
+    # --- FASE 5: 2ª PASSADA, SÓ PARA USE-AFTER-RETURN (CWE-562) ---
+    # Usar o endereço de uma variável local depois que a função retornou só é detectado com
+    # detect_stack_use_after_return=1, que no ASan do GCC 11 (o do sandbox) vem DESLIGADA: sem
+    # ela, o programa de teste com esse erro terminou "normalmente" (medido).
+    # Ela NÃO é ligada na passada principal porque muda o comportamento de programas com
+    # variável local não inicializada: as variáveis passam a morar numa pilha auxiliar zerada,
+    # o "lixo" vira 0 e o programa pode seguir outro caminho. Medido na submissao_5303358.c:
+    # desligada, o programa sempre cai em altura() (linha 68, ponteiro com lixo), como cairia
+    # no CodeBench, que roda sem ASan; ligada, cai em removeNo() (linha 46, ponteiro nulo) — um
+    # erro DIFERENTE do que reprovou o aluno. Por isso ela roda só quando a passada principal
+    # saiu limpa, e dela aproveita-se APENAS o relatório de use-after-return: qualquer outro
+    # sintoma nessa passada pode ser efeito da pilha zerada e é descartado.
+    env_uar = dict(env, ASAN_OPTIONS=env["ASAN_OPTIONS"] + ":detect_stack_use_after_return=1")
+    execucao_uar = subprocess.run(
+        comando_gdb, env=env_uar, capture_output=True, text=True, errors="replace",
+        input=stdin_analise, timeout=60,
+    )
+    saida_uar = execucao_uar.stdout + execucao_uar.stderr
+    if "AddressSanitizer: stack-use-after-return" in saida_uar:
+        return {
+            "tipo": "asan",
+            "erro": "Detectado pelo ASan (use-after-return, 2ª passada)",
+            "log": saida_uar,
         }
 
     # Nenhum erro de acesso nem crash: passa para a Malha 2 (Valgrind).
