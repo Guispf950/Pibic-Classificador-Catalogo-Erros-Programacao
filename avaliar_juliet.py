@@ -81,19 +81,34 @@ _PAI_NA_HIERARQUIA = {
     "CWE-127": "CWE-125",  # Buffer Under-read              -> Out-of-bounds Read
 }
 
-# Equivalências ADOTADAS PELO PROJETO — não é hierarquia oficial do MITRE (758 não é ancestral de
-# 824/457 na árvore do CWE), mas uma convenção de classificação: quando o Juliet rotula um caso
-# como CWE-758 ("Reliance on Undefined, Unspecified, or Implementation-Defined Behavior", um
-# guarda-chuva genérico), o que a ferramenta observa na prática é sempre uma de duas causas
-# específicas — ponteiro com lixo (CWE-824, via ASan/segfault) ou o valor não inicializado em si
-# (CWE-457, via Valgrind, antes do ponteiro ser usado) — nunca o CWE-758 "genérico" de volta, já
-# que esse código não tem regra para devolvê-lo. Investigado caso a caso (ver conversa): os 5
-# casos de CWE-758 testados foram TODOS 824 ou 457, nenhum "errado" de fato — é o próprio Juliet
-# rotulando pelo guarda-chuva onde a ferramenta soube ser mais específica. Decidido tratar como
-# equivalente "por enquanto" (15/10/2026) — revisar se a diferenciação 758 x 824/457 importar
-# para a pesquisa mais adiante.
+# Equivalências ADOTADAS PELO PROJETO — não são hierarquia oficial do MITRE (nenhum dos pares
+# abaixo é literalmente ancestral um do outro na árvore do CWE), mas convenções de classificação
+# justificadas caso a caso. Cada uma por um motivo DIFERENTE — não confundir:
+#
+# 1) CWE-758 ~ {CWE-824, CWE-457}: rotulagem genérica x específica.
+#    CWE-758 ("Reliance on Undefined, Unspecified, or Implementation-Defined Behavior") é um
+#    guarda-chuva abstrato do MITRE — não é sobre valor negativo nem absurdo, é sobre QUALQUER
+#    comportamento que o padrão C não garante. Investigando o código-fonte dos 5 casos do Juliet
+#    rotulados 758 na nossa amostra: todos seguem o MESMO padrão — um malloc() cujo conteúdo
+#    nunca é inicializado é lido e usado DIRETO como ponteiro, o que é literalmente a definição
+#    de CWE-824 (Access of Uninitialized Pointer). Quando a Malha 2 (Valgrind) pega o valor não
+#    inicializado ANTES do ponteiro ser usado, vira CWE-457 pelo mesmo motivo de fundo. Ou seja:
+#    o Juliet rotulou pelo guarda-chuva onde a ferramenta soube ser mais específica — nenhum dos
+#    5 casos testados estava "errado" de fato. Decidido tratar como equivalente "por enquanto"
+#    (15/10/2026) — revisar se a diferenciação 758 x 824/457 importar para a pesquisa depois.
+#
+# 2) CWE-195 ~ CWE-789 (bidirecional): "negativo" e "absurdo" são o MESMO número, por dois
+#    caminhos. Um valor negativo (195) convertido implicitamente para size_t (sem sinal) num
+#    malloc/memcpy/memset VIRA um número gigante (789) — é a mesma conversão de sinal que o
+#    próprio nome do CWE-195 descreve ("Signed to Unsigned Conversion Error"), só que o tamanho
+#    do número final decide qual das duas regras do cwe.py casa primeiro (negative-size-param,
+#    específica para memcpy/memset, vs. allocation-size-too-big, do malloc/calloc). MEDIDO: um
+#    CWE-195 cujo sink é malloc (não memcpy/memset) sai classificado CWE-789, pela mesma causa
+#    raiz. Decidido tratar como equivalente nos dois sentidos (15/10/2026).
 _EQUIVALENCIA_PROJETO = {
     "CWE-758": {"CWE-824", "CWE-457"},
+    "CWE-195": {"CWE-789"},
+    "CWE-789": {"CWE-195"},
 }
 
 # ── Entrada sintética por CWE ──────────────────────────────────────────────────
