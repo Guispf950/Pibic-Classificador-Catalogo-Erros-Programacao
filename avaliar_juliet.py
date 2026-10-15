@@ -48,7 +48,6 @@ from datetime import datetime, timezone
 
 from src.malha1_asan import executar_malha_1_asan
 from src.malha2_valgrind import executar_malha_2_valgrind
-from src.parser_logs import limpar_log_gdb
 from src.cwe import classificar_cwe, _NOME as CWES_SUPORTADOS  # mesma tabela do classificador
 
 
@@ -309,8 +308,18 @@ def avaliar_caso(caminho_fonte, pasta_testcasesupport, pasta_bin, cwe_esperado):
     if not resultado:
         return "-", "-", "Nenhuma", "passou_limpo", None
 
-    log_limpo = limpar_log_gdb(resultado["log"], os.path.basename(caminho_fonte))
-    cwe_id, cwe_nome = classificar_cwe(log_limpo)
+    # BUG CORRIGIDO (15/10/2026): classificava em cima do log LIMPO (limpar_log_gdb), que existe
+    # só para cortar ruído do backtrace ANTES de mostrar ao aluno ("preservando apenas as linhas
+    # relevantes para o feedback", ver parser_logs.py) — não tem relação com o que o cwe.py
+    # precisa. O próprio pipeline de produção (llm_client.classificar_erro, linha ~337) usa
+    # `log_bruto or log_limpo`, ou seja, PREFERE o bruto. Rodar em cima do limpo cortava
+    # justamente a seção do mapa de memória-sombra ("=>0x...: ca ca ca[ca]...") que a heurística
+    # de alloca/VLA em cwe.py precisa ler — e como o regex de fallback não achava mais nenhuma
+    # pista de posição, toda escrita de alloca caía no último recurso (nome do erro = "overflow"
+    # -> sempre "depois"/121, nunca "antes"/124). MEDIDO: 9 de 9 casos `_alloca_` do CWE-124 na
+    # amostra saíam 121 por esse motivo. Corrigido para classificar sobre o log bruto, igual à
+    # produção.
+    cwe_id, cwe_nome = classificar_cwe(resultado["log"])
     return cwe_id, cwe_nome, ferramenta, "detectado", resultado["log"]
 
 
