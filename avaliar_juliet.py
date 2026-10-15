@@ -104,10 +104,34 @@ _PAI_NA_HIERARQUIA = {
 #    específica para memcpy/memset, vs. allocation-size-too-big, do malloc/calloc). MEDIDO: um
 #    CWE-195 cujo sink é malloc (não memcpy/memset) sai classificado CWE-789, pela mesma causa
 #    raiz. Decidido tratar como equivalente nos dois sentidos (15/10/2026).
+#
+# 3) CWE-126/CWE-127 ~ CWE-457: mesmo padrão do item 1 (rótulo pela consequência x causa mais
+#    próxima), mas por um mecanismo diferente do 758. No padrão "CWE170 Improper Null
+#    Termination" do Juliet (ex.: strncpy() que não garante '\0' se a origem não cabe no limite
+#    copiado), o byte seguinte ao que deveria ser o fim da string fica com LIXO da pilha — pode ou
+#    não ser zero, por acaso. Se o %s/printLine for ler esse byte pra decidir se já chegou no fim
+#    da string, dois caminhos são possíveis: (a) o lixo por acaso é zero -> a string "termina" ali,
+#    sem overread de verdade nessa execução (não detectável, nem deveria ser); (b) o lixo não é
+#    zero -> a leitura continua por memória adjacente, e AÍ sim vira um over/under-read de verdade.
+#    O Valgrind, que rastreia inicialização byte a byte, flagra o acesso ao byte de lixo como "uso
+#    de valor não inicializado" (CWE-457) no INSTANTE em que ele é lido — antes mesmo de saber se
+#    o caminho (a) ou (b) vai acontecer. Ou seja, CWE-457 é a causa-raiz mais imediata e correta
+#    do ponto de vista da ferramenta; CWE-126/127 é a consequência eventual, que nem sempre se
+#    manifesta (explica também por que alguns desses casos "passam limpo"). MEDIDO: 2/10
+#    divergências do CWE-126 e 4/6 do CWE-127 na amostra de 20/CWE eram exatamente esse padrão.
+#    Decidido tratar como equivalente (15/10/2026).
+#
+# NÃO incluído: CWE-121 x CWE-122 (ver investigação do padrão "_CWE806_"/"_src_" — a confusão ali
+# é genuinamente pilha x heap, a mesma distinção que o resto do cwe.py foi construído pra acertar;
+# equiparar esconderia erros reais de classificação em outros casos). Ver comentário na conversa
+# de 15/10/2026 — fica documentado como limitação conhecida do rótulo do Juliet nesse subpadrão,
+# não como equivalência de código.
 _EQUIVALENCIA_PROJETO = {
     "CWE-758": {"CWE-824", "CWE-457"},
     "CWE-195": {"CWE-789"},
     "CWE-789": {"CWE-195"},
+    "CWE-126": {"CWE-457"},
+    "CWE-127": {"CWE-457"},
 }
 
 # ── Entrada sintética por CWE ──────────────────────────────────────────────────
