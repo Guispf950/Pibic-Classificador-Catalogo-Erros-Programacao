@@ -48,7 +48,8 @@ from datetime import datetime, timezone
 
 from src.malha1_asan import executar_malha_1_asan
 from src.malha2_valgrind import executar_malha_2_valgrind
-from src.cwe import classificar_cwe, _NOME as CWES_SUPORTADOS  # mesma tabela do classificador
+from src.cwe import _NOME as CWES_SUPORTADOS  # mesma tabela do classificador
+from src.llm_client import classificar_erro  # mesma função 100% determinística da produção
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -294,8 +295,11 @@ def carregar_candidatos(juliet_dir):
 def avaliar_caso(caminho_fonte, pasta_testcasesupport, pasta_bin, cwe_esperado):
     """
     Roda a cascata determinística sobre um único arquivo do Juliet.
-    Devolve (cwe_obtido, cwe_nome, ferramenta, status, log_bruto_ou_None).
+    Devolve (cwe_obtido, cwe_nome, ferramenta, status, linha_sintoma, linha_causa).
     `status`: "detectado" | "passou_limpo" | "erro_compilacao".
+    `linha_sintoma`/`linha_causa`: linhas que a FERRAMENTA (ASan/Valgrind) reportou — vêm do
+    mesmo extrator usado em produção (llm_client._extrair_pontos_anotacao, via classificar_erro).
+    Dá pra comparar direto com a "Linha do Defeito (manifest)" do gabarito do Juliet.
     """
     flags_extra = [
         "-DINCLUDEMAIN",
@@ -315,7 +319,7 @@ def avaliar_caso(caminho_fonte, pasta_testcasesupport, pasta_bin, cwe_esperado):
     ferramenta = "ASan+GDB"
 
     if resultado and resultado.get("tipo") == "compilacao":
-        return "-", "-", "Compilador (gcc)", "erro_compilacao", resultado["log"]
+        return "-", "-", "Compilador (gcc)", "erro_compilacao", "-", "-"
 
     if not resultado:
         resultado = executar_malha_2_valgrind(
@@ -327,10 +331,10 @@ def avaliar_caso(caminho_fonte, pasta_testcasesupport, pasta_bin, cwe_esperado):
         )
         ferramenta = "Valgrind+vgdb"
         if resultado and resultado.get("tipo") == "compilacao":
-            return "-", "-", "Compilador (gcc)", "erro_compilacao", resultado["log"]
+            return "-", "-", "Compilador (gcc)", "erro_compilacao", "-", "-"
 
     if not resultado:
-        return "-", "-", "Nenhuma", "passou_limpo", None
+        return "-", "-", "Nenhuma", "passou_limpo", "-", "-"
 
     # BUG CORRIGIDO (15/10/2026): classificava em cima do log LIMPO (limpar_log_gdb), que existe
     # só para cortar ruído do backtrace ANTES de mostrar ao aluno ("preservando apenas as linhas
@@ -343,8 +347,17 @@ def avaliar_caso(caminho_fonte, pasta_testcasesupport, pasta_bin, cwe_esperado):
     # -> sempre "depois"/121, nunca "antes"/124). MEDIDO: 9 de 9 casos `_alloca_` do CWE-124 na
     # amostra saíam 121 por esse motivo. Corrigido para classificar sobre o log bruto, igual à
     # produção.
-    cwe_id, cwe_nome = classificar_cwe(resultado["log"])
-    return cwe_id, cwe_nome, ferramenta, "detectado", resultado["log"]
+    #
+    # Usa classificar_erro (não só classificar_cwe) pra reaproveitar o MESMO extrator de linha
+    # que a produção usa — assim o CSV também traz a linha que a FERRAMENTA apontou como sintoma
+    # e causa, pra comparar com a "Linha do Defeito" do gabarito do manifest.xml. Continua 100%
+    # determinístico: classificar_erro não chama o LLM (só gerar_feedback chama).
+    with open(caminho_fonte, "r", encoding="utf-8", errors="replace") as f:
+        codigo_fonte = f.read()
+    analise = classificar_erro(resultado["log"], codigo_fonte, os.path.basename(caminho_fonte),
+                                log_bruto=resultado["log"])
+    return (analise["cwe_id"], analise["cwe_nome"], ferramenta, "detectado",
+            analise["linha_sintoma"], analise["linha_causa"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -482,11 +495,12 @@ def main():
         print(f"[{i}/{len(selecionados)}] {nome_arquivo} (esperado: {cwe_esperado}, linha {linha_defeito})")
         inicio = time.time()
         try:
-            cwe_obtido, cwe_nome, ferramenta, status, _log = avaliar_caso(
+            cwe_obtido, cwe_nome, ferramenta, status, linha_sintoma, linha_causa = avaliar_caso(
                 caminho, pasta_testcasesupport, pasta_bin, cwe_esperado
             )
         except Exception as e:  # caso travado/erro inesperado não aborta a rodada inteira
             cwe_obtido, cwe_nome, ferramenta, status = "-", "-", "Nenhuma", f"erro_interno: {e}"
+            linha_sintoma, linha_causa = "-", "-"
         duracao = round(time.time() - inicio, 2)
 
         acerto_estrito = (status == "detectado" and cwe_obtido == cwe_esperado)
@@ -505,6 +519,8 @@ def main():
             "Arquivo": nome_arquivo,
             "CWE Esperado (Juliet)": cwe_esperado,
             "Linha do Defeito (manifest)": linha_defeito,
+            "Linha Sintoma (ferramenta)": linha_sintoma,
+            "Linha Causa (ferramenta)": linha_causa,
             "CWE Obtido (pipeline)": cwe_obtido,
             "Nome CWE Obtido": cwe_nome,
             "Ferramenta": ferramenta,
