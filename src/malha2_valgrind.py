@@ -20,6 +20,7 @@ A lógica de espera fica isolada em `_aguardar_evento_valgrind` e nos parâmetro
 """
 
 import os
+import resource
 import subprocess
 import uuid
 import time
@@ -34,10 +35,21 @@ from src.config import VALGRIND_TIMEOUT_S, VALGRIND_POLL_S
 # ══════════════════════════════════════════════════════════════════════════════
 # PARÂMETROS DE SINCRONIZAÇÃO
 # ══════════════════════════════════════════════════════════════════════════════
-# Marcador que o Valgrind imprime no stderr QUANDO CONGELA num erro, aguardando o vgdb — sinal
-# confiável de "há um erro de execução para inspecionar ao vivo". Não usar "TO DEBUG THIS PROCESS
-# USING GDB": essa linha aparece em qualquer conexão do vgdb e não distingue erro real.
-MARCADOR_ERRO_EXECUCAO = "(action on error) vgdb me"
+# Marcadores que o Valgrind imprime no stderr QUANDO CONGELA, aguardando o vgdb — sinal
+# confiável de "há algo para inspecionar ao vivo". Não usar "TO DEBUG THIS PROCESS USING GDB":
+# essa linha aparece em qualquer conexão do vgdb e não distingue erro real.
+# Existem DOIS marcadores, não um: "(action on error) vgdb me" quando é o PRÓPRIO Memcheck que
+# detecta o erro (ex.: leitura inválida), e "(action on fatal signal) vgdb me" quando o processo
+# morre por um SINAL FATAL que o Valgrind não gerou (ex.: SIGABRT do "stack smashing detected"
+# do glibc, __stack_chk_fail — a proteção de pilha do próprio compilador reagindo a um overflow
+# antes do Memcheck ter chance de reportar). Faltava o segundo caso: sem reconhecê-lo, o laço de
+# espera nunca via o processo "travado" (ele está mesmo parado, esperando o vgdb) nem "terminado"
+# (não terminou, só está pausado) — ficava girando até estourar VALGRIND_TIMEOUT_S (120s) e
+# devolvia "passou limpo" para um programa que na verdade travou com stack smashing. MEDIDO:
+# reproduzido fora do pipeline com um binário real (Valgrind 3.22, Juliet
+# CWE121_..._alloca_cpy_31.c) — sem o marcador fatal, 120,7s e nenhum diagnóstico; com ele, cai
+# no mesmo fluxo de "erro de execução" que já existia, rápido.
+MARCADORES_ERRO_EXECUCAO = ("(action on error) vgdb me", "(action on fatal signal) vgdb me")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -80,10 +92,10 @@ def _aguardar_evento_valgrind(processo, stderr_buffer, lock,
     """
     inicio = time.time()
     while True:
-        # 1) Valgrind congelou num erro? (procura o marcador no stderr acumulado)
+        # 1) Valgrind congelou num erro ou sinal fatal? (procura os marcadores no stderr acumulado)
         with lock:
             texto_ate_agora = "".join(stderr_buffer)
-        if MARCADOR_ERRO_EXECUCAO in texto_ate_agora:
+        if any(marcador in texto_ate_agora for marcador in MARCADORES_ERRO_EXECUCAO):
             return "erro_execucao"
 
         # 2) Processo terminou sozinho? (sem erro que o congelasse -> leak/limpo)
@@ -101,20 +113,38 @@ def _aguardar_evento_valgrind(processo, stderr_buffer, lock,
 # MALHA 2
 # ══════════════════════════════════════════════════════════════════════════════
 
-def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", entrada=None):
+def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", entrada=None, flags_extra=None,
+                               limite_memoria_mb=None):
     """
     Executa o programa sob o Valgrind com conexão GDB via vgdb para inspeção ao vivo. Detecta
     falhas de execução e vazamentos de memória. Retorna dict com 'erro' e 'log', ou None se limpo.
+
+    `flags_extra`: ver docstring equivalente em `malha1_asan.executar_malha_1_asan` — mesmo uso
+    (harness do Juliet), mesma garantia de não afetar a submissão de aluno (sem esse argumento).
+
+    `limite_memoria_mb`: teto opcional (em MB) de memória VIRTUAL (RLIMIT_AS) para o processo do
+    Valgrind (e, por herança do fork/exec, para o programa analisado dentro dele). Sem isso, um
+    `malloc` de alguns GB (ex.: CWE-789 com valor "absurdo" mas ainda representável num `int` de
+    32 bits) fica dentro do que a máquina/sandbox consegue reservar de verdade — o Linux aceita
+    (overcommit) e o Valgrind tenta satisfazer o pedido de verdade, o que é lento (MEDIDO: >100s
+    num caso real) e trava a Malha 2 até o VALGRIND_TIMEOUT_S. Com o teto, o mesmo `malloc` falha
+    rápido (`malloc` devolve NULL) — MEDIDO: um `malloc(8 GB)` sob Valgrind com este teto em 1024
+    MB cai de >100s para <1s, sem afetar o restante do relatório do Memcheck (testado também com
+    um caso de vazamento real, que continuou detectado normalmente). Use um valor generoso o
+    bastante para o PRÓPRIO Valgrind iniciar (medido: 1 GB já é suficiente) e ainda assim bem
+    menor que a alocação "absurda" que se quer rejeitar. Só usado pelo harness do Juliet.
     """
 
     # --- FASE 1: COMPILAÇÃO LIMPA (SEM ASAN) ---
     # ASan e Valgrind não coexistem no mesmo binário (instrumentações conflitantes); compila só
     # com -g para manter os símbolos. -std=gnu11: mesmo motivo da Malha 1 — alinha ao CodeBench
     # (um GCC recente usa C23, onde `false`/`true`/`bool` são keywords e quebram códigos legados).
-    subprocess.run(
-        ["gcc", "-std=gnu11", "-g", caminho_codigo, "-o", binario_saida],
-        capture_output=True  # descarta a saída; erros de compilação são ignorados aqui
+    compilacao = subprocess.run(
+        ["gcc", "-std=gnu11", "-g", caminho_codigo, *(flags_extra or []), "-o", binario_saida],
+        capture_output=True, text=True, errors="replace"
     )
+    if compilacao.returncode != 0:
+        return {"tipo": "compilacao", "erro": "Erro de compilação", "log": compilacao.stderr}
 
     # --- FASE 2: IDENTIFICADOR ÚNICO PARA O SOCKET VGDB ---
     # O vgdb usa um socket em /tmp; o prefixo único evita colisões entre análises em paralelo.
@@ -146,6 +176,12 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", en
     else:
         stdin_analise = stdin_para_analise(caminho_codigo)
 
+    def _aplicar_limite_memoria():
+        # Roda DENTRO do processo filho, entre o fork() e o exec() do valgrind — por isso afeta
+        # tanto o próprio Valgrind quanto (por herança) o programa analisado dentro dele.
+        limite_bytes = limite_memoria_mb * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (limite_bytes, limite_bytes))
+
     # Popen (não run): o processo precisa rodar em paralelo enquanto se observa o stderr e (se
     # preciso) conecta o GDB. stderr=PIPE traz o relatório do Memcheck (observado ao vivo);
     # stdout=DEVNULL descarta a saída do programa (irrelevante à análise, e evita deadlock de pipe).
@@ -154,7 +190,8 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", en
         stdin=subprocess.PIPE if stdin_analise else None,
         stderr=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
-        text=True, errors="replace"
+        text=True, errors="replace",
+        preexec_fn=_aplicar_limite_memoria if limite_memoria_mb else None,
     )
 
     # Injeta o stdin logo após o lançamento; close() sinaliza EOF ao binário.

@@ -39,12 +39,28 @@ COMANDO_SIGINFO = (
 )
 
 
-def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=None):
+def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=None, flags_extra=None,
+                           limite_alocacao_mb=None):
     """
     Compila com AddressSanitizer e executa via GDB para capturar erros de acesso
     inválido (buffer overflow, use-after-free, stack overflow).
     Retorna dict com 'erro' e 'log' se algo for detectado, ou None se limpo.
     Memory leaks são delegados à Malha 2 (Valgrind+vgdb).
+
+    `flags_extra`: lista opcional de argumentos extra do gcc, inseridos entre o arquivo-fonte e
+    o `-o` (ex.: `-I`/caminho de include, defines como `-DINCLUDEMAIN`, ou um .c adicional para
+    linkar). Usado só pelo harness de validação contra o Juliet (`avaliar_juliet.py`), que
+    precisa compilar junto com `testcasesupport/io.c`; submissão de aluno (arquivo único, sem
+    dependências externas) nunca passa isso, então o comportamento de produção não muda.
+
+    `limite_alocacao_mb`: teto opcional (em MB) para o ASan rejeitar `malloc`/`calloc` de
+    propósito (CWE-789, "Memory Allocation with Excessive Size Value"). Sem isso, o ASan só
+    recusa pedidos ACIMA de ~1 TB por padrão — bem mais do que um `int` de 32 bits consegue
+    expressar (no máximo umas dezenas de GB), então pedidos "absurdos" nos testes nunca cruzam
+    esse teto: o ASan tenta alocar de verdade, o que é lento. Com `limite_alocacao_mb` definido,
+    qualquer pedido acima do teto vira erro IMEDIATO ("requested allocation size ... exceeds
+    maximum supported size"), independente de quanta RAM a máquina/sandbox tem. Também usado só
+    pelo harness do Juliet — não passado pela chamada de produção.
     """
 
     # --- FASE 1: COMPILAÇÃO COM ASAN ---
@@ -61,7 +77,7 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=No
          "-fsanitize=address",
          "-fsanitize-address-use-after-scope",
          "-fno-omit-frame-pointer",
-         "-g", caminho_codigo, "-o", binario_saida],
+         "-g", caminho_codigo, *(flags_extra or []), "-o", binario_saida],
         capture_output=True,
         text=True, errors="replace"
     )
@@ -87,6 +103,11 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=No
     #   gerando log mais rico do que o stack trace simples do LSan.
     # (detect_stack_use_after_return NÃO entra aqui — ver FASE 5.)
     env["ASAN_OPTIONS"] = "abort_on_error=1:detect_leaks=0"
+    if limite_alocacao_mb:
+        # allocator_may_return_null=0 (padrão): ao exceder o teto, o ASan ABORTA e GERA o
+        # relatório de erro, em vez de só devolver NULL silenciosamente — é o relatório que o
+        # cwe.py espera para reconhecer CWE-789.
+        env["ASAN_OPTIONS"] += f":max_allocation_size_mb={int(limite_alocacao_mb)}:allocator_may_return_null=0"
 
     # --- FASE 3: EXECUÇÃO VIA GDB (ANÁLISE POST-MORTEM) ---
     comando_gdb = [
