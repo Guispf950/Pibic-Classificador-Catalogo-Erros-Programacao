@@ -24,6 +24,7 @@ sys.path.insert(0, "/app")
 
 from src.malha1_asan import executar_malha_1_asan          # ASan + GDB (erros espaciais)
 from src.malha2_valgrind import executar_malha_2_valgrind  # Valgrind (não-inic., leaks)
+from src.malha_ubsan import executar_malha_ubsan, deve_refinar  # UBSan (estouro de int, índice)
 from src.parser_logs import limpar_log_gdb                 # filtra o log antes do LLM
 
 # Marcador que separa o RUÍDO (prints das malhas) do JSON de resultado. O sandbox.py
@@ -56,11 +57,21 @@ def analisar_arquivo(caminho_codigo: str, entrada=None) -> dict:
             ferramenta = f"ASan+GDB (crash: {resultado.get('sinal', 'sinal')})"
         else:
             ferramenta = "ASan+GDB"
+        # Segmentation fault genérico: o UBSan pode dizer que foi índice fora do vetor.
+        if deve_refinar(resultado):
+            refinado = executar_malha_ubsan(caminho_codigo, entrada=entrada, somente_indice=True)
+            if refinado:
+                resultado, ferramenta = refinado, "UBSan (refinando crash da Malha 1)"
     else:
         # ── MALHA 2: Valgrind + vgdb (só se a Malha 1 passou limpa) ───────────
         resultado = executar_malha_2_valgrind(caminho_codigo, entrada=entrada)
         if resultado:
             ferramenta = "Valgrind+vgdb"
+        else:
+            # ── MALHA UBSAN (só se as Malhas 1 e 2 passaram limpas) ───────────
+            resultado = executar_malha_ubsan(caminho_codigo, entrada=entrada)
+            if resultado:
+                ferramenta = "UBSan"
 
     # ── Monta o resultado ────────────────────────────────────────────────────
     if resultado and resultado.get("log"):

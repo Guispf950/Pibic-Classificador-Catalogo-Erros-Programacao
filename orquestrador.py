@@ -8,6 +8,11 @@ from src.malha1_asan import executar_malha_1_asan
 # Malha 2: Valgrind + vgdb (vícios semânticos: variáveis não inicializadas, leaks)
 from src.malha2_valgrind import executar_malha_2_valgrind
 
+# Malha UBSan: comportamento indefinido (estouro de int com sinal, índice fora de vetor de
+# tamanho fixo, deslocamento inválido). Roda depois das Malhas 1 e 2 limpas, ou para refinar
+# um segmentation fault genérico da Malha 1.
+from src.malha_ubsan import executar_malha_ubsan, deve_refinar
+
 # Parser unificado: filtra o log bruto antes de enviar ao LLM
 from src.parser_logs import limpar_log_gdb
 
@@ -88,6 +93,11 @@ def main():
                 ferramenta_usada = f"ASan+GDB (crash: {resultado.get('sinal', 'sinal')})"
             else:
                 ferramenta_usada = "ASan+GDB"
+            # Segmentation fault genérico: o UBSan pode dizer que foi índice fora do vetor.
+            if deve_refinar(resultado):
+                refinado = executar_malha_ubsan(caminho_codigo, somente_indice=True)
+                if refinado:
+                    resultado, ferramenta_usada = refinado, "UBSan (refinando crash da Malha 1)"
             log_bruto = resultado["log"]
 
         else:
@@ -97,6 +107,11 @@ def main():
             resultado = executar_malha_2_valgrind(caminho_codigo)
             if resultado:
                 ferramenta_usada = "Valgrind+vgdb"
+                log_bruto = resultado["log"]
+
+            # ── MALHA UBSAN: só se as Malhas 1 e 2 passaram limpas ───────────
+            elif (resultado := executar_malha_ubsan(caminho_codigo)):
+                ferramenta_usada = "UBSan"
                 log_bruto = resultado["log"]
 
             else:

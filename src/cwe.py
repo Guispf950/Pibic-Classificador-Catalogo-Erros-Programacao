@@ -17,7 +17,11 @@ A classificação tem duas camadas, avaliadas numa ÚNICA sequência de priorida
        variable"; do byte marcado no mapa de memória-sombra (alloca/VLA); do nome do erro;
      - segmentation fault: o ENDEREÇO da falha (impresso pelo GDB a partir de $_siginfo, ver
        malha1_asan.py) separa ponteiro nulo, recursão sem fim, escrita em memória só-leitura
-       e ponteiro com lixo -> CWE-476/674/758/824.
+       e ponteiro com lixo -> CWE-476/674/758/824;
+     - cópia com origem e destino sobrepostos: se o tamanho copiado passa do espaço do
+       destino, o erro real é estouro (121/122/787) e a sobreposição é só efeito colateral;
+     - relatório do UBSan (malha_ubsan.py): índice fora do vetor, estouro de inteiro com sinal,
+       deslocamento de bits inválido etc. -> CWE-129/190/191/1335/369/476/758.
 
 Os textos procurados foram conferidos no ambiente do sandbox (GCC 11.4, GDB 12.1,
 Valgrind 3.18.1). Versões novas do ASan trocaram "to the left/right of" por "before/after";
@@ -38,7 +42,9 @@ _NOME = {
     "CWE-125": "Out-of-bounds Read",
     "CWE-126": "Buffer Over-read",
     "CWE-127": "Buffer Under-read",
+    "CWE-129": "Improper Validation of Array Index",
     "CWE-190": "Integer Overflow or Wraparound",
+    "CWE-191": "Integer Underflow (Wrap or Wraparound)",
     "CWE-195": "Signed to Unsigned Conversion Error",
     "CWE-369": "Divide By Zero",
     "CWE-401": "Missing Release of Memory after Effective Lifetime",
@@ -56,6 +62,7 @@ _NOME = {
     "CWE-789": "Memory Allocation with Excessive Size Value",
     "CWE-824": "Access of Uninitialized Pointer",
     "CWE-825": "Expired Pointer Dereference",
+    "CWE-1335": "Incorrect Bitwise Shift of Integer",
 }
 
 # Retorno quando o log não casa nenhuma classe conhecida (ex.: erro de compilação).
@@ -114,6 +121,12 @@ _RX_NAO_INICIALIZADO = re.compile(
 # casava e rotulava vazamento em programas sem vazamento. "possibly lost" também é vazamento
 # (ponteiro só para o meio do bloco) e o Valgrind já o conta como erro por padrão.
 _RX_VAZAMENTO      = re.compile(r"blocks are (?:definitely|indirectly|possibly) lost", re.I)
+# Estouro na pilha pego pelo PROTETOR DE PILHA do gcc (não pelo ASan): ao sair da função, o valor
+# "sentinela" ao lado das variáveis locais foi sobrescrito -> "*** stack smashing detected ***".
+# Acontece quando a escrita passa por uma função que o ASan não intercepta (ex.: wcscpy no GCC 11
+# do sandbox — Juliet CWE121 ..._src_wchar_t_alloca_cpy_31). A linha apontada é o FIM da função
+# (onde a sentinela é conferida), não a linha da cópia.
+_RX_STACK_SMASHING = re.compile(r"stack smashing detected", re.I)
 # Divisão por zero: GDB ("SIGFPE, Arithmetic exception"), ASan ("FPE on unknown address")
 # e Valgrind ("Integer divide by zero" / "signal 8 (SIGFPE)").
 _RX_DIVISAO_ZERO   = re.compile(
@@ -203,8 +216,16 @@ def _classificar_estouro_asan(log):
     acesso = _RX_ACESSO.search(log)
     acesso = acesso.group(1) if acesso else None
     lado = _RX_LADO_ASAN.search(log)
+    sombra = _RX_BYTE_SOMBRA.search(log)
+    sombra = sombra.group(1).lower() if sombra else ""
     if lado:
         lado = "antes" if lado.group(1).lower() in ("left", "before") else "depois"
+    elif regiao == "dynamic-stack" and sombra in (_SOMBRA_ANTES | _SOMBRA_DEPOIS):
+        # alloca/VLA nunca aparece na lista de variáveis do quadro; se o acesso acontece em OUTRA
+        # função (o ponteiro foi passado adiante), o ASan descreve o endereço pelo quadro dessa
+        # outra função e a "variável mais próxima" é de outro vetor. Medido no Juliet CWE124
+        # ..._char_alloca_loop_45 (escrita ANTES do alloca saía 121). O byte de sombra é a pista certa.
+        lado = "antes" if sombra in _SOMBRA_ANTES else "depois"
     elif _lado_pela_pilha(log):
         lado = _lado_pela_pilha(log)
     else:
@@ -212,8 +233,6 @@ def _classificar_estouro_asan(log):
         if lado:
             lado = "antes" if lado.group(1).lower() == "underflows" else "depois"
         else:
-            sombra = _RX_BYTE_SOMBRA.search(log)
-            sombra = sombra.group(1).lower() if sombra else ""
             if sombra in _SOMBRA_ANTES:
                 lado = "antes"
             elif sombra in _SOMBRA_DEPOIS:
@@ -293,6 +312,103 @@ def _classificar_segfault(log):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 4. REFINAMENTO: cópia com origem e destino sobrepostos
+# ══════════════════════════════════════════════════════════════════════════════
+# Ex. (Juliet CWE121 ..._CWE805_char_declare_ncpy_10): strncpy de 99 bytes num `char dest[50]`.
+# A cópia passa do fim de dest e invade a variável vizinha, que é justamente a ORIGEM — o ASan
+# checa a sobreposição primeiro e reporta "strncpy-param-overlap". O erro real é o estouro.
+# Regra: o 1º intervalo do relatório é o DESTINO ([início, fim) = bytes que seriam escritos);
+# se esse tamanho passa do espaço que o destino tem a partir do início, é estouro de escrita
+# (121 pilha / 122 heap / 787 global); senão, é sobreposição de verdade (CWE-475).
+_RX_INTERVALOS_SOBREPOSTOS = re.compile(
+    r"-param-overlap: memory ranges \[(0x[0-9a-fA-F]+),\s*(0x[0-9a-fA-F]+)\)")
+# Pilha: "Address 0x7ffd... is located in stack of thread T0 at offset 48 in frame", seguido da
+# lista de variáveis da função ("[48, 98) 'dataBadBuffer'").
+_RX_ENDERECO_PILHA = re.compile(
+    r"Address (0x[0-9a-fA-F]+) is located in stack of thread \w+ at offset (\d+) in frame")
+# Heap: "0x50e000000040 is located 0 bytes inside of 150-byte region [...]".
+_RX_DENTRO_HEAP = re.compile(r"(0x[0-9a-fA-F]+) is located (\d+) bytes inside of (\d+)-byte region")
+# Global: "... of global variable 'gdst' defined in 'x.c:4:6' (0x5c9c2178e1a0) of size 50".
+_RX_GLOBAL = re.compile(r"global variable '[^']*' defined in '[^']*' \((0x[0-9a-fA-F]+)\) of size (\d+)")
+
+
+def _espaco_do_destino(log, inicio):
+    """(região, bytes disponíveis a partir de `inicio`) do destino da cópia; None se o log não diz."""
+    for m in _RX_ENDERECO_PILHA.finditer(log):
+        if int(m.group(1), 16) != inicio:
+            continue
+        deslocamento = int(m.group(2))
+        for a, b in _RX_VAR_PILHA.findall(log[m.end():]):
+            if int(a) <= deslocamento < int(b):
+                return "stack", int(b) - deslocamento
+        return None
+    for m in _RX_DENTRO_HEAP.finditer(log):
+        if int(m.group(1), 16) == inicio:
+            return "heap", int(m.group(3)) - int(m.group(2))
+    g = _RX_GLOBAL.search(log)
+    if g:
+        base, tamanho = int(g.group(1), 16), int(g.group(2))
+        if base <= inicio < base + tamanho:
+            return "global", base + tamanho - inicio
+    return None
+
+
+def _classificar_sobreposicao(log):
+    if not _RX_SOBREPOSICAO.search(log):
+        return None
+    m = _RX_INTERVALOS_SOBREPOSTOS.search(log)      # Valgrind não dá os intervalos: fica 475
+    if m:
+        inicio, fim = int(m.group(1), 16), int(m.group(2), 16)
+        destino = _espaco_do_destino(log, inicio)
+        if destino and (fim - inicio) > destino[1]:
+            return _cwe_por_limites(destino[0], "WRITE", "depois")
+    return "CWE-475"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. RELATÓRIO DO UBSAN (malha_ubsan.py)
+# ══════════════════════════════════════════════════════════════════════════════
+# Formato: "arquivo.c:5:31: runtime error: <descrição>". Conferido no sandbox (GCC 11.4).
+_RX_UBSAN = re.compile(r"runtime error: (.*)")
+# "signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'". A DIREÇÃO
+# (para cima = 190, para baixo = 191) sai da própria conta, refeita com inteiros do Python
+# (sem limite): resultado verdadeiro negativo = passou do MENOR valor do tipo.
+_RX_UB_ESTOURO = re.compile(r"signed integer overflow: (-?\d+) ([-+*]) (-?\d+) cannot be represented")
+_RX_UB_NEGACAO = re.compile(r"negation of -?\d+ cannot be represented")
+_RX_UB_DIV_MIN = re.compile(r"division of -?\d+ by -1 cannot be represented")   # INT_MIN / -1
+_RX_UB_INDICE = re.compile(
+    r"index -?\d+ out of bounds for type|variable length array bound evaluates to non-positive")
+_RX_UB_SHIFT = re.compile(r"shift exponent|shift of negative value|left shift of")
+_RX_UB_DIV_ZERO = re.compile(r"division by zero")
+_RX_UB_NULO = re.compile(r"null pointer")
+
+
+def _classificar_ubsan(log):
+    m = _RX_UBSAN.search(log)
+    if not m:
+        return None
+    msg = m.group(1)
+    conta = _RX_UB_ESTOURO.search(msg)
+    if conta:
+        a, op, b = int(conta.group(1)), conta.group(2), int(conta.group(3))
+        verdadeiro = a + b if op == "+" else a - b if op == "-" else a * b
+        return "CWE-191" if verdadeiro < 0 else "CWE-190"
+    if _RX_UB_NEGACAO.search(msg) or _RX_UB_DIV_MIN.search(msg):
+        return "CWE-190"            # o resultado (positivo) não cabe no tipo
+    if _RX_UB_INDICE.search(msg):
+        return "CWE-129"            # índice/tamanho de vetor não validado
+    if _RX_UB_SHIFT.search(msg):
+        return "CWE-1335"
+    if _RX_UB_DIV_ZERO.search(msg):
+        return "CWE-369"
+    if _RX_UB_NULO.search(msg):
+        return "CWE-476"
+    # Demais comportamentos indefinidos que o UBSan aponta (ex.: endereço desalinhado, valor
+    # inválido para bool/enum): o próprio CWE genérico de comportamento indefinido.
+    return "CWE-758"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SEQUÊNCIA DE PRIORIDADE — o primeiro passo que reconhece o log vence.
 # ══════════════════════════════════════════════════════════════════════════════
 # A ordem desambigua erros que compartilham marcadores no log (ex.: double-free e
@@ -313,14 +429,17 @@ _PASSOS = [
     # Outros erros nomeados pelo ASan
     _regra(_RX_RECURSAO, "CWE-674"),
     _regra(_RX_ALOCACAO_ABSURDA, "CWE-789"),
-    _regra(_RX_SOBREPOSICAO, "CWE-475"),
+    _classificar_sobreposicao,
     _regra(_RX_TAMANHO_NEGATIVO, "CWE-195"),
     _regra(_RX_CALCULO_TAMANHO, "CWE-190"),
+    # UBSan (o log da malha UBSan só tem o relatório dele)
+    _classificar_ubsan,
     # Valgrind
     _regra(_RX_NAO_INICIALIZADO, "CWE-457"),
     _regra(_RX_VAZAMENTO, "CWE-401"),
     _classificar_invalido_valgrind,
     # Crash por sinal (o GDB pega antes do ASan)
+    _regra(_RX_STACK_SMASHING, "CWE-121"),
     _regra(_RX_DIVISAO_ZERO, "CWE-369"),
     _classificar_segfault,
 ]
@@ -366,7 +485,10 @@ _TIPO_POR_CWE = {
     "CWE-789": "excessive-allocation-size",
     "CWE-475": "overlapping-memory-copy",
     "CWE-195": "negative-size-argument",
-    "CWE-190": "allocation-size-overflow",
+    "CWE-190": "integer-overflow",
+    "CWE-191": "integer-underflow",
+    "CWE-129": "array-index-out-of-bounds",
+    "CWE-1335": "invalid-bit-shift",
 }
 
 

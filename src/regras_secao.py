@@ -33,6 +33,10 @@ _REGRAS_BRUTAS = [
         r"use-after-scope"),
     ("SINTOMA", "liberação inválida de memória (double-free / free inválido)",
         r"attempting (?:double-)?free|double-free|Invalid free|Mismatched free"),
+    # Protetor de pilha do gcc: o frame "__fortify_fail (msg=... "stack smashing detected")" vem
+    # ANTES do frame do aluno no backtrace, então a seção já está aberta quando ele aparece.
+    ("SINTOMA", "estouro de vetor na pilha: a corrupção foi detectada ao SAIR desta função",
+        r"stack smashing detected"),
     ("SINTOMA", "divisão por zero (operação aritmética inválida)",
         r"SIGFPE|Arithmetic exception|\bFPE on unknown address|Integer divide by zero"),
     ("SINTOMA", "a pilha de chamadas esgotou (recursão sem condição de parada)",
@@ -45,6 +49,16 @@ _REGRAS_BRUTAS = [
         r"requested allocation size|allocation-size-too-big"),
     ("SINTOMA", "o cálculo do tamanho da alocação estourou (overflow)",
         r"calloc parameters overflow|reallocarray parameters overflow"),
+    # UBSan (malha_ubsan.py): "arquivo.c:5:31: runtime error: <descrição>" — a linha do aluno
+    # vem na MESMA linha do cabeçalho.
+    ("SINTOMA", "índice fora dos limites do vetor (índice não validado)",
+        r"runtime error: (?:index -?\d+ out of bounds|variable length array bound)"),
+    ("SINTOMA", "a conta passou do limite do tipo inteiro (estouro de inteiro)",
+        r"runtime error: (?:signed integer overflow|negation of|division of .* by -1)"),
+    ("SINTOMA", "deslocamento de bits inválido (quantidade negativa ou grande demais)",
+        r"runtime error: (?:shift exponent|left shift of)"),
+    ("SINTOMA", "comportamento indefinido apontado pelo UBSan",
+        r"runtime error:"),
     # Sob o GDB o SIGSEGV chega antes do ASan: "Program received signal SIGSEGV, Segmentation
     # fault." (casa "Segmentation fault"). Valgrind: "Access not within mapped region" /
     # "Bad permissions for mapped region" (escrita em memória só-leitura).

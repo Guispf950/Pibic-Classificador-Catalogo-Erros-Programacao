@@ -60,6 +60,10 @@ def limpar_log_gdb(log_bruto, nome_arquivo):
             # GDB: o sinal que derrubou o programa (SIGFPE, SIGSEGV...) e o endereço da falha
             # que a Malha 1 pede ao GDB (ver malha1_asan.COMANDO_SIGINFO).
             "received signal", "PIPELINE_SIGINFO",
+            # UBSan (malha_ubsan.py): "arquivo.c:5:31: runtime error: ..."
+            "runtime error",
+            # Protetor de pilha do gcc ("*** stack smashing detected ***: terminated")
+            "stack smashing",
             # Valgrind
             "Conditional jump", "definitely lost", "indirectly lost", "possibly lost", "Invalid",
             "Mismatched free", "Uninitialized", "uninitialised", "use-after-scope",

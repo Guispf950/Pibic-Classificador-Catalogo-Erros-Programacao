@@ -20,6 +20,7 @@ A lógica de espera fica isolada em `_aguardar_evento_valgrind` e nos parâmetro
 """
 
 import os
+import re
 import resource
 import subprocess
 import uuid
@@ -50,6 +51,9 @@ from src.config import VALGRIND_TIMEOUT_S, VALGRIND_POLL_S
 # CWE121_..._alloca_cpy_31.c) — sem o marcador fatal, 120,7s e nenhum diagnóstico; com ele, cai
 # no mesmo fluxo de "erro de execução" que já existia, rápido.
 MARCADORES_ERRO_EXECUCAO = ("(action on error) vgdb me", "(action on fatal signal) vgdb me")
+
+# Linha de registro de um vazamento real (ver uso no Caso C, no fim do arquivo).
+_RX_REGISTRO_VAZAMENTO = re.compile(r"blocks are (?:definitely|indirectly|possibly) lost")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -265,9 +269,13 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", en
     with lock:
         log_final_valgrind = "".join(stderr_buffer)
 
-    # "definitely lost": bloco alocado e nunca liberado, com ponteiro perdido (vazamento certo).
+    # Vazamento: só a linha de REGISTRO de perda ("N bytes in M blocks are definitely lost in loss
+    # record ..."), a mesma regra do cwe.py. Antes bastava o texto "definitely lost", que também
+    # aparece no RESUMO ("definitely lost: 0 bytes in 0 blocks") sempre que sobra memória ainda
+    # alcançável no fim — o programa sem vazamento saía "detectado" e sem CWE. MEDIDO no Juliet
+    # CWE127 ..._malloc_wchar_t_cpy_45 (versão corrigida).
     # A segunda condição pega qualquer outro erro contabilizado no sumário final.
-    if "definitely lost" in log_final_valgrind or (
+    if _RX_REGISTRO_VAZAMENTO.search(log_final_valgrind) or (
         "ERROR SUMMARY" in log_final_valgrind
         and "ERROR SUMMARY: 0 errors" not in log_final_valgrind
     ):
