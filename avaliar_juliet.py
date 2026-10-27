@@ -654,8 +654,10 @@ def main():
                          "Default via env JULIET_CWES.")
     ap.add_argument("--por-cwe", type=int, default=int(os.environ.get("JULIET_POR_CWE", "5")),
                     help="Quantos casos sortear POR CWE (padrão: 5). Default via env JULIET_POR_CWE.")
-    ap.add_argument("--juliet-dir", default=os.environ.get("JULIET_DIR", "./data/juliet/C"),
-                    help="Pasta que contém manifest.xml, testcases/ e testcasesupport/ (padrão: ./data/juliet/C). "
+    # O dataset fica FORA do projeto (no WSL, em ~/datasets/juliet), para não ser sincronizado pelo
+    # Google Drive nem pesar no repositório; procedência em data/juliet/README.md.
+    ap.add_argument("--juliet-dir", default=os.environ.get("JULIET_DIR", os.path.expanduser("~/datasets/juliet/C")),
+                    help="Pasta que contém manifest.xml, testcases/ e testcasesupport/ (padrão: ~/datasets/juliet/C). "
                          "Default via env JULIET_DIR.")
     ap.add_argument("--saida", default=os.environ.get("JULIET_SAIDA", "./output/avaliacao_juliet.csv"),
                     help="CSV de resultado da rodada atual. Default via env JULIET_SAIDA.")

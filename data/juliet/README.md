@@ -1,7 +1,10 @@
 # Juliet Test Suite for C/C++ v1.3 — procedência
 
-Dataset de **validação do módulo de detecção e classificação** (Goal G1). Fica só na
-máquina: o conteúdo desta pasta é ignorado pelo git (ver `.gitignore`), exceto este README.
+Dataset de **validação do módulo de detecção e classificação** (Goal G1). O dataset **não fica
+no projeto**: mora no WSL, em `~/datasets/juliet/` (zip + `C/` extraído), fora da pasta
+sincronizada pelo Google Drive e fora do git. Esta pasta guarda só este README de procedência.
+O `avaliar_juliet.py` procura em `~/datasets/juliet/C` por padrão (`--juliet-dir` ou `JULIET_DIR`
+mudam isso). Movido para lá em 27/10/2026 (SHA-256 conferido; 106.093 arquivos em `C/`).
 
 ## Origem
 
@@ -17,6 +20,7 @@ máquina: o conteúdo desta pasta é ignorado pelo git (ver `.gitignore`), excet
 ## Como restaurar
 
 ```bash
+mkdir -p ~/datasets/juliet && cd ~/datasets/juliet
 curl -L -o juliet-test-suite-c-cpp-v1.3.zip \
   https://samate.nist.gov/SARD/downloads/test-suites/2017-10-01-juliet-test-suite-for-c-cplusplus-v1-3.zip
 sha256sum juliet-test-suite-c-cpp-v1.3.zip   # deve bater com o SHA-256 acima
