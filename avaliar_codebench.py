@@ -23,11 +23,16 @@ Este script faz três coisas, nesta ordem:
 
 ── Como usar (dentro do contêiner, ver data/codebench/README.md) ──
     python3 avaliar_codebench.py --inventario                 # só o manifesto, não roda código
+    python3 avaliar_codebench.py --listar-candidatos          # elegíveis por questão, não roda código
     python3 avaliar_codebench.py --total 30 --seed 42         # 30 submissões sorteadas
     python3 avaliar_codebench.py --por-questao 2 --seed 7     # 2 por questão
     python3 avaliar_codebench.py --total 50 --analisar todas  # pipeline também nas aceitas
     python3 avaliar_codebench.py --total 40 --veredito reprovadas   # só as NÃO aceitas
     python3 avaliar_codebench.py --por-questao 1 --veredito RE      # 1 travamento por questão
+    python3 avaliar_codebench.py --total 30 --veredito WA,RE --todos-erros  # + coluna "Outros Erros"
+
+Parâmetros e colunas iniciais são os mesmos do avaliar_juliet.py (ver experimentos.py):
+--por-grupo é o mesmo que --por-questao aqui (grupo = questão).
 
 O dataset traz a ÚLTIMA versão de cada aluno, e a maioria é aceita (~86% numa amostra de 251).
 Com --veredito, a amostra é completada só com o veredito pedido: as submissões são embaralhadas
@@ -50,8 +55,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 
+import experimentos
 from src.malha1_asan import executar_malha_1_asan
 from src.malha2_valgrind import executar_malha_2_valgrind
 from src.malha_ubsan import executar_malha_ubsan, deve_refinar
@@ -69,12 +75,18 @@ LIMITE_MEMORIA_BYTES = 1024 ** 3        # 1 GB de memória virtual por execuçã
 # arquivo de dados. Ver data/codebench/README.md.
 _RX_NOME_ARQUIVO = re.compile(r"^[\w.-]+\.(?:txt|bin|dat|csv)$")
 # Vereditos: AC aceito | WA resposta errada | RE travamento por SINAL (segfault, divisão por zero,
-# abort) | EXIT terminou com código ≠ 0 (ex.: "return 1;") | TLE tempo excedido | CE compilação.
-# Prioridade para escolher o caso que alimenta o pipeline (e o veredito geral da submissão):
-# travamento primeiro (é o foco do módulo), depois resposta errada, depois código de saída ≠ 0,
-# depois tempo excedido (o mais lento para as malhas).
-_PRIORIDADE_FALHA = ("RE", "WA", "EXIT", "TLE")
-VEREDITOS = ("AC", "WA", "RE", "EXIT", "TLE", "CE")
+# abort) | EXIT terminou com código ≠ 0 (ex.: "return 1;") | TLE tempo excedido | OLE saída sem
+# fim (passou de LIMITE_SAIDA_BYTES, o sistema mata com o sinal 25, SIGXFSZ) | CE compilação.
+# Ordem do veredito GERAL da submissão (o 1º presente vence):
+_PRIORIDADE_FALHA = ("RE", "WA", "EXIT", "TLE", "OLE")
+# Casos que alimentam o PIPELINE, nesta ordem. TLE e OLE ficam de fora: laço infinito não tem erro
+# de memória para as malhas acharem (elas só esperariam o próprio limite de 60 s), e com OLE o
+# programa imprime sem parar debaixo do GDB, que não tem limite de saída — MEDIDO: o Python
+# acumulava a saída até o contêiner ser morto por falta de memória (2 rodadas perdidas na
+# submissão "Classificação de Triângulos", aluno 3629624088).
+_PRIORIDADE_PIPELINE = ("RE", "WA", "EXIT")
+VEREDITOS = ("AC", "WA", "RE", "EXIT", "TLE", "OLE", "CE")
+_SIGXFSZ = 25
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -271,6 +283,10 @@ def julgar(sub, pasta_trabalho, tempo_limite):
             except subprocess.TimeoutExpired:
                 resultados.append((n, "TLE", f"> {tempo_limite}s"))
                 continue
+        if codigo == -_SIGXFSZ:
+            # Morto por passar do limite de saída: imprime sem parar (quase sempre laço infinito).
+            resultados.append((n, "OLE", f"saída > {LIMITE_SAIDA_BYTES // 1024 // 1024} MB"))
+            continue
         if codigo < 0:
             # Morto por SINAL = travamento de verdade (ex.: -11 SIGSEGV, -8 SIGFPE, -6 SIGABRT).
             resultados.append((n, "RE", f"sinal {-codigo}"))
@@ -306,8 +322,8 @@ def julgar(sub, pasta_trabalho, tempo_limite):
 # 3. Pipeline (mesma cascata da produção: api/runner_analise.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def rodar_pipeline(sub, entrada, pasta_trabalho):
-    """Devolve (ferramenta, status, cwe, nome, linha_sintoma, linha_causa)."""
+def rodar_pipeline(sub, entrada, pasta_trabalho, todos_erros=False):
+    """Devolve (ferramenta, status, cwe, nome, linha_sintoma, linha_causa, outros_erros)."""
     fonte = os.path.join(pasta_trabalho, "main.c")      # cópia: as malhas compilam e rodam aqui
     shutil.copy(os.path.join(sub["_pasta_aluno"], "main.c"), fonte)
     flags = ["-lm"]
@@ -318,7 +334,7 @@ def rodar_pipeline(sub, entrada, pasta_trabalho):
                                   entrada=entrada, flags_extra=flags)
         ferramenta = "ASan+GDB"
         if r and r.get("tipo") == "compilacao":
-            return "Compilador (gcc)", "erro_compilacao", "-", "-", "-", "-"
+            return "Compilador (gcc)", "erro_compilacao", "-", "-", "-", "-", "-"
         if deve_refinar(r):
             ref = executar_malha_ubsan(fonte, binario_saida=os.path.join(pasta_trabalho, "b_ubsan"),
                                        entrada=entrada, flags_extra=flags, somente_indice=True)
@@ -326,17 +342,23 @@ def rodar_pipeline(sub, entrada, pasta_trabalho):
                 r, ferramenta = ref, "UBSan (refinando crash)"
         if not r:
             r = executar_malha_2_valgrind(fonte, binario_saida=os.path.join(pasta_trabalho, "b_vg"),
-                                          entrada=entrada, flags_extra=flags)
+                                          entrada=entrada, flags_extra=flags,
+                                          continuar_apos_erro=todos_erros)  # dispensa a varredura extra
             ferramenta = "Valgrind+vgdb"
         if not r:
             r = executar_malha_ubsan(fonte, binario_saida=os.path.join(pasta_trabalho, "b_ubsan"),
                                      entrada=entrada, flags_extra=flags)
             ferramenta = "UBSan"
         if not r:
-            return "Nenhuma", "passou_limpo", "-", "-", "-", "-"
+            return "Nenhuma", "passou_limpo", "-", "-", "-", "-", "-"
         with open(fonte, encoding="utf-8", errors="replace") as f:
             a = classificar_erro(r["log"], f.read(), "main.c", log_bruto=r["log"])
-        return ferramenta, "detectado", a["cwe_id"], a["cwe_nome"], a["linha_sintoma"], a["linha_causa"]
+        outros = "-"
+        if todos_erros:
+            outros = experimentos.outros_erros(fonte, os.path.join(pasta_trabalho, "b_varredura"), entrada,
+                                               flags, principal=(a["cwe_id"], a["linha_sintoma"]),
+                                               log_completo=r.get("log_completo"))
+        return ferramenta, "detectado", a["cwe_id"], a["cwe_nome"], a["linha_sintoma"], a["linha_causa"], outros
     finally:
         os.chdir(cwd_antes)
 
@@ -344,15 +366,6 @@ def rodar_pipeline(sub, entrada, pasta_trabalho):
 # ══════════════════════════════════════════════════════════════════════════════
 # Programa principal
 # ══════════════════════════════════════════════════════════════════════════════
-
-def _commit_dataset(raiz):
-    try:
-        r = subprocess.run(["git", "-C", raiz, "rev-parse", "--short", "HEAD"],
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() or "-"
-    except Exception:
-        return "-"
-
 
 def _gravar_csv(caminho, linhas, modo="w"):
     if not linhas:
@@ -377,8 +390,13 @@ def main():
                     default=os.environ.get("CODEBENCH_DIR", os.path.expanduser("~/datasets/cb-dataset")),
                     help="Raiz do cb-dataset (padrão: ~/datasets/cb-dataset).")
     ap.add_argument("--inventario", action="store_true", help="Só gera o manifesto e sai (não roda código).")
+    ap.add_argument("--listar-candidatos", action="store_true",
+                    help="Só mostra quantas submissões elegíveis existem por questão (o 'grupo' do "
+                         "--por-grupo) e sai, sem compilar/rodar nada. O veredito (WA, RE...) não aparece: "
+                         "o dataset não o traz, e saber exige julgar cada submissão.")
     ap.add_argument("--total", type=int, help="Quantas submissões sortear (entre as incluídas).")
-    ap.add_argument("--por-questao", type=int, help="Quantas submissões sortear POR questão.")
+    ap.add_argument("--por-grupo", "--por-questao", dest="por_questao", type=int,
+                    help="Quantas submissões sortear POR questão.")
     ap.add_argument("--seed", type=int, default=42, help="Semente do sorteio (reprodutibilidade).")
     ap.add_argument("--tempo-limite", type=float, default=TEMPO_LIMITE_PADRAO_S,
                     help=f"Tempo máximo por caso de teste no juiz, em segundos (padrão {TEMPO_LIMITE_PADRAO_S}).")
@@ -389,6 +407,9 @@ def main():
                     help="Filtro da amostra pelo veredito do juiz: 'todos' (padrão), 'reprovadas' (tudo que "
                          "não é AC) ou lista separada por vírgula, ex.: 'RE,WA'. Com filtro, as submissões são "
                          "embaralhadas pela semente e julgadas uma a uma até completar a amostra.")
+    ap.add_argument("--todos-erros", action="store_true",
+                    help="Depois da cascata, roda a varredura completa do Valgrind e preenche a coluna "
+                         "'Outros Erros' com os demais erros distintos (mais lento).")
     ap.add_argument("--saida-dir", default="./output", help="Pasta dos CSVs (padrão ./output).")
     args = ap.parse_args()
 
@@ -407,6 +428,17 @@ def main():
     for m, n in motivos.most_common():
         print(f"         excluídas por '{m}': {n}")
     print(f"[Info] Manifesto: {os.path.join(args.saida_dir, 'codebench_manifesto.csv')}")
+    if args.listar_candidatos:
+        # Equivalente ao --listar-candidatos do avaliar_juliet.py (lá o grupo é o CWE).
+        por_q = collections.defaultdict(list)
+        for sub in incluidas:
+            por_q[sub["Id Questão"]].append(sub)
+        print(f"\n{'Id Questão':<14}{'elegíveis':>10}  Questão (lista)")
+        for q in sorted(por_q, key=lambda q: (-len(por_q[q]), q)):
+            ex = por_q[q][0]
+            print(f"{q:<14}{len(por_q[q]):>10}  {ex['Questão']} ({ex['Lista']})")
+        print(f"{'TOTAL':<14}{len(incluidas):>10}  em {len(por_q)} questões")
+        return
     if args.inventario:
         return
 
@@ -436,7 +468,12 @@ def main():
           f"pipeline: {args.analisar}\n")
 
     # ── 3. Juiz (+ filtro) + pipeline ──
-    linhas, linhas_testes = [], []
+    # Os CSVs são gravados LINHA A LINHA: numa rodada longa (horas), uma queda perde só a
+    # submissão em andamento. MEDIDO: a 1ª rodada nas 1.884 reprovadas morreu na nº 370 e, como
+    # só gravava no fim, não deixou nada.
+    csv_aval = experimentos.CsvIncremental(os.path.join(args.saida_dir, "avaliacao_codebench.csv"))
+    csv_testes = experimentos.CsvIncremental(os.path.join(args.saida_dir, "codebench_testes.csv"))
+    linhas = []
     julgadas = 0                      # quantas foram julgadas para completar a amostra (transparência)
     vereditos_julgados = collections.Counter()
     for _, candidatos, cota in grupos:
@@ -456,14 +493,14 @@ def main():
                 pegas += 1
                 print(f"[{len(linhas) + 1}] {sub['Questão']} | aluno {sub['Id Aluno']}")
                 for n, v, det in por_caso:
-                    linhas_testes.append({"Id Questão": sub["Id Questão"], "Id Aluno": sub["Id Aluno"],
-                                          "Caso": n, "Veredito": v, "Detalhe": det})
+                    csv_testes.escrever({"Id Questão": sub["Id Questão"], "Id Aluno": sub["Id Aluno"],
+                                         "Caso": n, "Veredito": v, "Detalhe": det})
 
                 caso_analisado, ver_caso = "-", "-"
-                ferramenta, status, cwe, nome, sint, causa = "-", "nao_analisado", "-", "-", "-", "-"
+                ferramenta, status, cwe, nome, sint, causa, outros = "-", "nao_analisado", "-", "-", "-", "-", "-"
                 alvo = None
                 if geral not in ("AC", "CE") and args.analisar != "nenhuma":
-                    for prioridade in _PRIORIDADE_FALHA:
+                    for prioridade in _PRIORIDADE_PIPELINE:
                         alvo = next(((n, v) for n, v, _ in por_caso if v == prioridade), None)
                         if alvo:
                             break
@@ -475,7 +512,11 @@ def main():
                     with open(caminho_in, encoding="utf-8", errors="replace") as f:
                         entrada = f.read()
                     try:
-                        ferramenta, status, cwe, nome, sint, causa = rodar_pipeline(sub, entrada, trab)
+                        ferramenta, status, cwe, nome, sint, causa, outros = rodar_pipeline(
+                            sub, entrada, trab, todos_erros=args.todos_erros)
+                    except subprocess.TimeoutExpired:
+                        # Uma malha passou do próprio limite (60 s) — típico de TLE (laço infinito).
+                        status = "timeout_malha"
                     except Exception as e:  # um caso problemático não derruba a rodada
                         status = f"erro_interno: {type(e).__name__}"
 
@@ -483,29 +524,29 @@ def main():
             wa = [d for _, v, d in por_caso if v == "WA"]
             duracao = round(time.time() - inicio, 2)
             print(f"      -> veredito {geral} ({dict(cont) or erro_comp[:60]}) | pipeline: {status} {cwe} ({duracao}s)")
-            linhas.append({
+            # Colunas comuns aos dois datasets (experimentos.py); as próprias do CodeBench vêm depois.
+            # Item = turma/questão/aluno: o mesmo aluno pode ter a mesma questão em duas turmas.
+            turma_id = sub["Turma"].rsplit("(", 1)[-1].rstrip(")")
+            linha = {
+                **experimentos.linha_nucleo(
+                    "codebench", f"{turma_id}/{sub['Id Questão']}/{sub['Id Aluno']}", sub["Id Questão"], "-",
+                    ferramenta, status, cwe, nome, sint, causa, outros, duracao),
                 **{k: sub[k] for k in ("Disciplina", "Turma", "Lista", "Questão", "Id Questão", "Id Aluno",
                                         "Casos de Teste", "Arquivos de Dados")},
                 "Veredito": geral,
-                **{v: cont.get(v, 0) for v in ("AC", "WA", "RE", "EXIT", "TLE")},
+                **{v: cont.get(v, 0) for v in ("AC", "WA", "RE", "EXIT", "TLE", "OLE")},
                 # "sim" = TODAS as respostas erradas diferem só em linhas em branco (pode ser rigor do juiz)
                 "WA Só Linhas em Branco": ("sim" if wa and all(d == "só linhas em branco" for d in wa)
                                            else "não" if wa else "-"),
                 "Caso Analisado": caso_analisado,
                 "Veredito do Caso": ver_caso,
-                "Ferramenta": ferramenta,
-                "Status Pipeline": status,
-                "CWE": cwe,
-                "Nome CWE": nome,
-                "Linha Sintoma": sint,
-                "Linha Causa": causa,
-                "Tempo (s)": duracao,
-            })
+            }
+            linhas.append(linha)
+            csv_aval.escrever(linha)
+    csv_aval.fechar()
+    csv_testes.fechar()
     if not linhas:
         sys.exit(f"[Aviso] Nenhuma submissão com veredito {args.veredito} nas {julgadas} julgadas.")
-
-    _gravar_csv(os.path.join(args.saida_dir, "avaliacao_codebench.csv"), linhas)
-    _gravar_csv(os.path.join(args.saida_dir, "codebench_testes.csv"), linhas_testes)
 
     # ── Resumo + histórico ──
     vered = collections.Counter(l["Veredito"] for l in linhas)
@@ -513,19 +554,18 @@ def main():
     detect = [l for l in analisadas if l["Status Pipeline"] == "detectado"]
     re_ = [l for l in analisadas if l["Veredito do Caso"] == "RE"]
     re_det = [l for l in re_ if l["Status Pipeline"] == "detectado"]
-    resumo = {
-        "Data/Hora (UTC)": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        "Commit dataset": _commit_dataset(args.codebench_dir),
-        "Seed": args.seed, "Total": args.total or "-", "Por Questão": args.por_questao or "-",
-        "Tempo Limite (s)": args.tempo_limite, "Analisar": args.analisar, "Filtro Veredito": args.veredito,
+    especificos = {
+        "Tempo Limite (s)": args.tempo_limite, "Analisar": args.analisar,
         "Julgadas": julgadas,
         **{f"Julgadas {v}": vereditos_julgados.get(v, 0) for v in VEREDITOS},
-        "Submissões": len(linhas),
         **{f"Veredito {v}": vered.get(v, 0) for v in VEREDITOS},
-        "Pipeline Rodou": len(analisadas), "Pipeline Detectou": len(detect),
         "Casos RE": len(re_), "RE Detectados": len(re_det),
     }
-    _gravar_csv(os.path.join(args.saida_dir, "codebench_historico.csv"), [resumo], modo="a")
+    amostragem = (f"{args.por_questao} por grupo (questão)" if args.por_questao else f"{args.total} no total")
+    experimentos.registrar_historico(
+        os.path.join(args.saida_dir, "codebench_historico.csv"), "codebench",
+        experimentos.versao_dataset(args.codebench_dir), args.seed, amostragem, f"veredito {args.veredito}",
+        args.todos_erros, linhas, especificos)
 
     print("\n" + "=" * 60)
     print("RESUMO")
@@ -535,7 +575,7 @@ def main():
     if re_:
         print(f"Cobertura em erro de execução (RE): {len(re_det)}/{len(re_)} "
               f"({100 * len(re_det) / len(re_):.1f}%)")
-    cwes = collections.Counter(l["CWE"] for l in detect)
+    cwes = collections.Counter(l["CWE Obtido"] for l in detect)
     if cwes:
         print("CWEs encontrados:", ", ".join(f"{c}: {n}" for c, n in cwes.most_common()))
     print(f"\n[Info] CSVs em {args.saida_dir}: avaliacao_codebench.csv, codebench_testes.csv, "

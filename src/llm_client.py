@@ -334,7 +334,7 @@ def classificar_erro(log_limpo, codigo_fonte="", nome_arquivo="", log_bruto=""):
     linha_causa = str(pontos["CAUSA"][0]) if "CAUSA" in pontos else "-"
 
     # 3) CWE + nome + tipo_erro — determinísticos, da assinatura do log.
-    cwe_id, cwe_nome, tipo_erro = classificar_cwe_tipo(log_bruto or log_limpo)
+    cwe_id, cwe_nome, tipo_erro = classificar_cwe_tipo(log_bruto or log_limpo, codigo_fonte)
 
     # 4) Evidência: linha REAL do relatório (âncora anti-alucinação).
     evidencia_log = _evidencia_do_log(log_bruto or log_limpo)

@@ -31,6 +31,8 @@ from src.deteccao_entrada import stdin_para_analise
 
 # Parâmetros de tempo (teto e intervalo de poll) vêm do config central.
 from src.config import VALGRIND_TIMEOUT_S, VALGRIND_POLL_S
+# Mesmo teto da varredura completa, para o programa que segue depois do 1º erro.
+from src.varredura_valgrind import VARREDURA_TIMEOUT_S
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -118,10 +120,19 @@ def _aguardar_evento_valgrind(processo, stderr_buffer, lock,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", entrada=None, flags_extra=None,
-                               limite_memoria_mb=None):
+                               limite_memoria_mb=None, continuar_apos_erro=False):
     """
     Executa o programa sob o Valgrind com conexão GDB via vgdb para inspeção ao vivo. Detecta
     falhas de execução e vazamentos de memória. Retorna dict com 'erro' e 'log', ou None se limpo.
+
+    `continuar_apos_erro` (opção --todos-erros / TODOS_ERROS=1): depois da "foto" do GDB no 1º
+    erro, em vez de encerrar o programa, desliga as próximas paradas e o deixa ir até o fim. O
+    dict ganha 'log_completo' (o relatório do Memcheck com TODOS os erros), que a varredura
+    (varredura_valgrind.extrair_blocos) reaproveita sem rodar o Valgrind de novo. O 'log' do erro
+    principal continua sendo o texto até o congelamento — o mesmo de antes: MEDIDO em 4 casos do
+    CodeBench, o que o Valgrind imprimia depois do `v.kill` era só "Reset valgrind output to log".
+    Desligado por padrão: deixar o programa seguir custa tempo (até VARREDURA_TIMEOUT_S num laço
+    sem fim depois do erro).
 
     `flags_extra`: ver docstring equivalente em `malha1_asan.executar_malha_1_asan` — mesmo uso
     (harness do Juliet), mesma garantia de não afetar a submissão de aluno (sem esse argumento).
@@ -224,26 +235,39 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", en
     if status == "erro_execucao":
         # Valgrind parado no ponto exato do erro (código do aluno). Sem corrida: conecta-se o GDB
         # para fotografar backtrace + variáveis nesse instante.
+        # Texto do Memcheck até o congelamento: é o relatório do erro principal. Guardado ANTES do
+        # GDB porque, com continuar_apos_erro, o programa volta a rodar e imprime os erros seguintes.
+        with lock:
+            ate_congelar = "".join(stderr_buffer)
+        if continuar_apos_erro:
+            # v.set vgdb-error: nenhuma parada a mais (o 1º erro já foi fotografado); detach: o
+            # programa segue sob o Memcheck, que anota os demais erros e, no fim, os vazamentos.
+            fim_gdb = ["-ex", "monitor v.set vgdb-error 999999999", "-ex", "detach"]
+        else:
+            fim_gdb = ["-ex", "monitor v.kill"]   # encerra o processo monitorado de forma limpa
         comando_gdb = [
             "gdb", "-q", "--batch",
             "-ex", f"target remote | vgdb --vgdb-prefix={id_unico}",
             "-ex", "bt full",          # backtrace completo com variáveis de cada frame
-            "-ex", "monitor v.kill",   # encerra o processo monitorado de forma limpa
+            *fim_gdb,
             "-ex", "quit",
             binario_saida
         ]
         execucao_gdb = subprocess.run(comando_gdb, capture_output=True, text=True, errors="replace")
         saida_gdb = execucao_gdb.stdout + execucao_gdb.stderr
 
-        # Após o kill, o Valgrind finaliza e imprime o resto do relatório: aguarda-se o processo e
-        # a thread leitora para capturar o veredito completo do Memcheck.
+        # Após o kill (ou o fim do programa), o Valgrind finaliza e imprime o resto do relatório:
+        # aguarda-se o processo e a thread leitora para capturar o veredito completo do Memcheck.
+        # Um programa que, solto, entra em laço sem fim é encerrado no teto da varredura; o que o
+        # Memcheck já anotou até ali continua valendo.
         try:
-            processo_valgrind.wait(timeout=30)
+            processo_valgrind.wait(timeout=VARREDURA_TIMEOUT_S if continuar_apos_erro else 30)
         except subprocess.TimeoutExpired:
             processo_valgrind.kill()
         leitor.join(timeout=5)
         with lock:
-            veredito_valgrind = "".join(stderr_buffer)
+            veredito_valgrind = ate_congelar if continuar_apos_erro else "".join(stderr_buffer)
+            log_completo = "".join(stderr_buffer)
 
         # Combina o VEREDITO do Valgrind (o QUÊ + a ORIGEM) com o BACKTRACE do GDB (o ONDE + os
         # valores das variáveis). O parser depois separa sinal de ruído.
@@ -253,7 +277,10 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", en
             + "\n===== BACKTRACE E VARIAVEIS (GDB via vgdb) =====\n"
             + saida_gdb
         )
-        return {"erro": "Falha de Execução (Valgrind)", "log": log_combinado}
+        resultado = {"erro": "Falha de Execução (Valgrind)", "log": log_combinado}
+        if continuar_apos_erro:
+            resultado["log_completo"] = log_completo
+        return resultado
 
     # ── Caso B: TIMEOUT (ex.: loop infinito) ──
     if status == "timeout":
@@ -279,7 +306,11 @@ def executar_malha_2_valgrind(caminho_codigo, binario_saida="./bin_valgrind", en
         "ERROR SUMMARY" in log_final_valgrind
         and "ERROR SUMMARY: 0 errors" not in log_final_valgrind
     ):
-        return {"erro": "Vazamento de Memória (Valgrind)", "log": log_final_valgrind}
+        # O programa já rodou até o fim: o relatório final é, ele mesmo, o "log completo".
+        resultado = {"erro": "Vazamento de Memória (Valgrind)", "log": log_final_valgrind}
+        if continuar_apos_erro:
+            resultado["log_completo"] = log_final_valgrind
+        return resultado
 
     # Nenhum erro encontrado: retorna None (o código passou nesta malha).
     return None

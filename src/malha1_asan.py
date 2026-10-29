@@ -148,6 +148,8 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=No
     #     (buffer overflow, use-after-free, stack/global overflow, use-after-return). Aqui o
     #     log já traz linha e função — o mais rico possível. Leaks ficam de fora (detect_leaks=0).
     if "ERROR: AddressSanitizer" in saida_completa:
+        if "heap-use-after-free" in saida_completa:
+            saida_completa += _pilhas_completas_do_bloco(binario_saida, env, stdin_analise)
         return {
             "tipo": "asan",
             "erro": "Detectado pelo ASan",
@@ -195,3 +197,40 @@ def executar_malha_1_asan(caminho_codigo, binario_saida="./bin_asan", entrada=No
 
     # Nenhum erro de acesso nem crash: passa para a Malha 2 (Valgrind).
     return None
+
+
+# Marcador da seção acrescentada ao log por _pilhas_completas_do_bloco (lido pelo cwe.py).
+MARCA_PILHAS_COMPLETAS = "===== PILHAS COMPLETAS DO BLOCO (fast_unwind_on_malloc=0) ====="
+
+
+def _pilhas_completas_do_bloco(binario, env, stdin_analise):
+    """
+    Num uso de memória já liberada (heap-use-after-free), roda o binário MAIS UMA VEZ, sem GDB,
+    com fast_unwind_on_malloc=0, e devolve as pilhas de liberação e de alocação do bloco (texto a
+    acrescentar ao log, ou "" se a 2ª execução não repetir o erro).
+
+    Por quê: por padrão o ASan monta essas pilhas pelo modo RÁPIDO, que se perde dentro da
+    biblioteca C (compilada sem frame pointer) e corta a pilha antes de chegar ao código do aluno.
+    MEDIDO: getline() liberando o bloco antigo ao realocar — as duas pilhas paravam em
+    __GI___getdelim seguido de "<unknown module>", sem o main; no modo completo aparece o main
+    (linha do getline). Sem as pilhas inteiras não dá para saber QUEM liberou o bloco, e o cwe.py
+    precisa disso para separar "uso após free" de "ponteiro com lixo que caiu num bloco liberado
+    pelo próprio sistema" (RE03 do CodeBench: no modo completo, o bloco foi alocado e liberado
+    pela inicialização do ASan, antes do main).
+    Só nesse erro: o modo completo deixa malloc/free bem mais lentos (MEDIDO: 300 mil pares
+    malloc+free, 0,06 s -> 0,75 s), então não vale ligá-lo para todos os programas.
+    """
+    env_completo = dict(env, ASAN_OPTIONS=env["ASAN_OPTIONS"] + ":fast_unwind_on_malloc=0")
+    try:
+        execucao = subprocess.run([binario], env=env_completo, capture_output=True, text=True,
+                                  errors="replace", input=stdin_analise, timeout=60)
+    except subprocess.TimeoutExpired:
+        return ""
+    relatorio = execucao.stderr
+    if "heap-use-after-free" not in relatorio:
+        return ""                     # a 2ª execução não repetiu o erro: nada a acrescentar
+    inicio = relatorio.find("freed by thread")
+    fim = relatorio.find("SUMMARY: AddressSanitizer", inicio)
+    if inicio < 0 or fim < 0:
+        return ""
+    return f"\n{MARCA_PILHAS_COMPLETAS}\n{relatorio[inicio:fim]}"

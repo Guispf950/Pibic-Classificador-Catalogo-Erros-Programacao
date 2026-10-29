@@ -20,6 +20,12 @@ script; a chamada de produção (`orquestrador.py`) não passa esse argumento e 
     python avaliar_juliet.py --cwes 121,122,124,126,127 --por-cwe 5
     python avaliar_juliet.py --cwes todos --por-cwe 3 --seed 7
     python avaliar_juliet.py --listar-candidatos --cwes 369   # só lista, não compila/roda
+    python avaliar_juliet.py --total 50 --seed 42             # 50 casos sorteados entre todos os CWEs
+    python avaliar_juliet.py --por-grupo 5 --todos-erros      # + coluna "Outros Erros" (varredura completa)
+    python avaliar_juliet.py --por-grupo 3 --saida-dir output/teste  # CSVs numa pasta à parte
+
+    Parâmetros e colunas iniciais são os mesmos do avaliar_codebench.py (ver experimentos.py):
+    --por-grupo é o mesmo que --por-cwe aqui (grupo = CWE); --saida-dir escolhe a pasta dos CSVs.
 
     # equivalente via variável de ambiente (útil pra automatizar/repetir sem digitar a linha
     # toda); flag de linha de comando tem prioridade sobre a variável quando os dois aparecem.
@@ -53,6 +59,7 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
+import experimentos
 from src.malha1_asan import executar_malha_1_asan
 from src.malha2_valgrind import executar_malha_2_valgrind
 from src.malha_ubsan import executar_malha_ubsan, deve_refinar
@@ -340,12 +347,13 @@ def carregar_candidatos(juliet_dir):
 # Execução de um caso pelo pipeline determinístico (Malha 1 -> Malha 2 -> cwe.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def avaliar_caso(caminho_fonte, pasta_testcasesupport, pasta_bin, cwe_esperado, versao="bad"):
+def avaliar_caso(caminho_fonte, pasta_testcasesupport, pasta_bin, cwe_esperado, versao="bad", todos_erros=False):
     """
     Roda a cascata determinística sobre um único arquivo do Juliet.
     `versao="good"` compila com -DOMITBAD: só as funções CORRIGIDAS do caso rodam, e qualquer
     detecção é ALARME FALSO (métrica de falsos positivos, como na literatura de sanitizers).
-    Devolve (cwe_obtido, cwe_nome, ferramenta, status, linha_sintoma, linha_causa).
+    `todos_erros=True`: depois da cascata, a varredura completa do Valgrind lista os demais erros.
+    Devolve (cwe_obtido, cwe_nome, ferramenta, status, linha_sintoma, linha_causa, outros_erros).
     `status`: "detectado" | "passou_limpo" | "erro_compilacao".
     `linha_sintoma`/`linha_causa`: linhas que a FERRAMENTA (ASan/Valgrind) reportou — vêm do
     mesmo extrator usado em produção (llm_client._extrair_pontos_anotacao, via classificar_erro).
@@ -371,7 +379,7 @@ def avaliar_caso(caminho_fonte, pasta_testcasesupport, pasta_bin, cwe_esperado, 
     ferramenta = "ASan+GDB"
 
     if resultado and resultado.get("tipo") == "compilacao":
-        return "-", "-", "Compilador (gcc)", "erro_compilacao", "-", "-"
+        return "-", "-", "Compilador (gcc)", "erro_compilacao", "-", "-", "-"
 
     # Mesmas regras da produção (api/runner_analise.py): crash genérico -> tenta refinar pelo
     # UBSan (só índice fora do vetor); Malhas 1 e 2 limpas -> Malha UBSan completa.
@@ -389,10 +397,11 @@ def avaliar_caso(caminho_fonte, pasta_testcasesupport, pasta_bin, cwe_esperado, 
             entrada=entrada,
             flags_extra=flags_extra,
             limite_memoria_mb=LIMITE_MEMORIA_VALGRIND_MB,
+            continuar_apos_erro=todos_erros,   # o relatório completo dispensa a varredura extra
         )
         ferramenta = "Valgrind+vgdb"
         if resultado and resultado.get("tipo") == "compilacao":
-            return "-", "-", "Compilador (gcc)", "erro_compilacao", "-", "-"
+            return "-", "-", "Compilador (gcc)", "erro_compilacao", "-", "-", "-"
 
     if not resultado:
         resultado = executar_malha_ubsan(
@@ -401,7 +410,7 @@ def avaliar_caso(caminho_fonte, pasta_testcasesupport, pasta_bin, cwe_esperado, 
         ferramenta = "UBSan"
 
     if not resultado:
-        return "-", "-", "Nenhuma", "passou_limpo", "-", "-"
+        return "-", "-", "Nenhuma", "passou_limpo", "-", "-", "-"
 
     # BUG CORRIGIDO (15/10/2026): classificava em cima do log LIMPO (limpar_log_gdb), que existe
     # só para cortar ruído do backtrace ANTES de mostrar ao aluno ("preservando apenas as linhas
@@ -423,8 +432,14 @@ def avaliar_caso(caminho_fonte, pasta_testcasesupport, pasta_bin, cwe_esperado, 
         codigo_fonte = f.read()
     analise = classificar_erro(resultado["log"], codigo_fonte, os.path.basename(caminho_fonte),
                                 log_bruto=resultado["log"])
+    outros = "-"
+    if todos_erros:
+        outros = experimentos.outros_erros(
+            caminho_fonte, os.path.join(pasta_bin, f"{base}_varredura"), entrada, flags_extra,
+            principal=(analise["cwe_id"], analise["linha_sintoma"]),
+            limite_memoria_mb=LIMITE_MEMORIA_VALGRIND_MB, log_completo=resultado.get("log_completo"))
     return (analise["cwe_id"], analise["cwe_nome"], ferramenta, "detectado",
-            analise["linha_sintoma"], analise["linha_causa"])
+            analise["linha_sintoma"], analise["linha_causa"], outros)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -547,7 +562,7 @@ def resumo_por_lentes(linhas):
       como ver (causas A e B); L4 = L3 contando C e D como acerto (a ferramenta reportou um defeito
       verdadeiro). Devolve dict com (acertos, total) de cada lente.
     """
-    validos = [l for l in linhas if l["Status"] != "erro_compilacao"]
+    validos = [l for l in linhas if l["Status Pipeline"] != "erro_compilacao"]
     l1 = sum(l["Acerto Estrito"] == "sim" for l in validos)
     l2 = sum(l["Acerto com Hierarquia/Convenção"] == "sim" for l in validos)
     escopo = [l for l in validos if l["Causa"] not in (CAUSA_A, CAUSA_B)]
@@ -561,64 +576,24 @@ def resumo_por_lentes(linhas):
 # Histórico (1 linha por rodada) e divergências (1 linha por caso errado, acumulado)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _commit_atual():
-    """Hash curto do commit atual do repo, para amarrar um % de acerto a uma versão do cwe.py."""
-    try:
-        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() if r.returncode == 0 else "-"
-    except Exception:
-        return "-"
-
-
-def _preparar_acumulado(caminho, campos):
-    """
-    True se `caminho` já existe com o MESMO cabeçalho (é só acrescentar). Se o cabeçalho mudou
-    (o script ganhou colunas), o arquivo antigo é renomeado — preservado — e um novo começa, em vez
-    de misturar colunas.
-    """
-    if not os.path.isfile(caminho):
-        return False
-    with open(caminho, encoding="utf-8", newline="") as f:
-        cabecalho = next(csv.reader(f), [])
-    if cabecalho == campos:
-        return True
-    os.replace(caminho, caminho.replace(".csv", f"_ate_{datetime.now().strftime('%Y%m%d%H%M%S')}.csv"))
-    return False
-
-
-def _registrar_historico(caminho_historico, args, cwes_pedidos, linhas_csv):
-    """Acrescenta (não sobrescreve) uma linha-resumo desta rodada em output/juliet_historico.csv."""
-    total = len(linhas_csv)
-    compilacao_falhou = sum(1 for l in linhas_csv if l["Status"] == "erro_compilacao")
-
-    linha = {
-        "Data/Hora (UTC)": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        "Commit cwe.py": _commit_atual(),
-        "Versão": args.versao,
-        "CWEs Testados": ",".join(cwes_pedidos),
-        "Por CWE": args.por_cwe,
-        "Seed": args.seed,
-        "Total de Casos": total,
-        "Falhas de Compilação": compilacao_falhou,
-    }
+def _registrar_historico(caminho_historico, args, cwes_pedidos, linhas_csv, versao_ds, amostragem):
+    """Acrescenta (não sobrescreve) uma linha-resumo desta rodada: colunas comuns (experimentos.py)
+    + as próprias do Juliet (versão, CWEs, lentes ou alarmes falsos)."""
+    especificos = {"Versão": args.versao, "CWEs Testados": ",".join(cwes_pedidos)}
     if args.versao == "good":
+        total = len(linhas_csv)
         alarmes = sum(1 for l in linhas_csv if l["Natureza da Detecção"] == NATUREZA_ALARME_FALSO)
         vazamentos = sum(1 for l in linhas_csv if l["Natureza da Detecção"] == NATUREZA_VAZAMENTO_REAL)
-        linha["Alarmes Falsos"] = alarmes
-        linha["Alarmes Falsos (%)"] = round(100 * alarmes / total, 1) if total else 0
-        linha["Vazamentos Reais no Código Corrigido"] = vazamentos
+        especificos["Alarmes Falsos"] = alarmes
+        especificos["Alarmes Falsos (%)"] = round(100 * alarmes / total, 1) if total else 0
+        especificos["Vazamentos Reais no Código Corrigido"] = vazamentos
     else:
         for lente, (acertos, n) in resumo_por_lentes(linhas_csv).items():
-            linha[f"{lente} acertos"] = acertos
-            linha[f"{lente} casos"] = n
-            linha[f"{lente} (%)"] = round(100 * acertos / n, 1) if n else 0
-
-    existe = _preparar_acumulado(caminho_historico, list(linha.keys()))
-    with open(caminho_historico, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=linha.keys())
-        if not existe:
-            writer.writeheader()
-        writer.writerow(linha)
+            especificos[f"{lente} acertos"] = acertos
+            especificos[f"{lente} casos"] = n
+            especificos[f"{lente} (%)"] = round(100 * acertos / n, 1) if n else 0
+    experimentos.registrar_historico(caminho_historico, "juliet", versao_ds, args.seed, amostragem,
+                                     f"versão {args.versao}", args.todos_erros, linhas_csv, especificos)
 
 
 def _registrar_divergencias(caminho_divergencias, linhas_csv):
@@ -634,7 +609,7 @@ def _registrar_divergencias(caminho_divergencias, linhas_csv):
         return
     agora = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     campos = ["Data/Hora (UTC)"] + list(divergentes[0].keys())
-    existe = _preparar_acumulado(caminho_divergencias, campos)
+    existe = experimentos.preparar_acumulado(caminho_divergencias, campos)
     with open(caminho_divergencias, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=campos)
         if not existe:
@@ -652,27 +627,43 @@ def main():
     ap.add_argument("--cwes", default=os.environ.get("JULIET_CWES", "todos"),
                     help="Lista separada por vírgula, ex.: '121,122,127', ou 'todos' (os 24 suportados). "
                          "Default via env JULIET_CWES.")
-    ap.add_argument("--por-cwe", type=int, default=int(os.environ.get("JULIET_POR_CWE", "5")),
-                    help="Quantos casos sortear POR CWE (padrão: 5). Default via env JULIET_POR_CWE.")
+    ap.add_argument("--por-grupo", "--por-cwe", dest="por_cwe", type=int,
+                    default=int(os.environ.get("JULIET_POR_CWE", "5")),
+                    help="Quantos casos sortear POR CWE (padrão: 5). Default via env JULIET_POR_CWE. "
+                         "Ignorado se --total for usado.")
+    ap.add_argument("--total", type=int,
+                    help="Quantos casos sortear NO TOTAL, entre todos os CWEs pedidos (em vez de N por CWE).")
+    ap.add_argument("--todos-erros", action="store_true",
+                    help="Depois da cascata, roda a varredura completa do Valgrind e preenche a coluna "
+                         "'Outros Erros' com os demais erros distintos (mais lento).")
     # O dataset fica FORA do projeto (no WSL, em ~/datasets/juliet), para não ser sincronizado pelo
     # Google Drive nem pesar no repositório; procedência em data/juliet/README.md.
     ap.add_argument("--juliet-dir", default=os.environ.get("JULIET_DIR", os.path.expanduser("~/datasets/juliet/C")),
                     help="Pasta que contém manifest.xml, testcases/ e testcasesupport/ (padrão: ~/datasets/juliet/C). "
                          "Default via env JULIET_DIR.")
-    ap.add_argument("--saida", default=os.environ.get("JULIET_SAIDA", "./output/avaliacao_juliet.csv"),
-                    help="CSV de resultado da rodada atual. Default via env JULIET_SAIDA.")
+    ap.add_argument("--saida-dir", default=os.environ.get("JULIET_SAIDA_DIR", "./output"),
+                    help="Pasta dos CSVs (padrão ./output), como no avaliar_codebench.py: avaliacao_juliet.csv, "
+                         "juliet_historico.csv e juliet_divergencias.csv. Default via env JULIET_SAIDA_DIR.")
+    ap.add_argument("--saida", default=os.environ.get("JULIET_SAIDA"),
+                    help="(Opcional) caminho de um CSV específico, no lugar de <saida-dir>/avaliacao_juliet.csv. "
+                         "Default via env JULIET_SAIDA.")
     ap.add_argument("--seed", type=int, default=int(os.environ.get("JULIET_SEED", "42")),
                     help="Semente da amostragem (reprodutibilidade). Default via env JULIET_SEED.")
-    ap.add_argument("--historico", default=os.environ.get("JULIET_HISTORICO", "./output/juliet_historico.csv"),
-                    help="CSV cumulativo (1 linha por rodada). Default via env JULIET_HISTORICO.")
-    ap.add_argument("--divergencias", default=os.environ.get("JULIET_DIVERGENCIAS", "./output/juliet_divergencias.csv"),
-                    help="CSV cumulativo dos casos que não bateram o rótulo oficial. Default via env JULIET_DIVERGENCIAS.")
+    ap.add_argument("--historico", default=os.environ.get("JULIET_HISTORICO"),
+                    help="(Opcional) no lugar de <saida-dir>/juliet_historico.csv. Default via env JULIET_HISTORICO.")
+    ap.add_argument("--divergencias", default=os.environ.get("JULIET_DIVERGENCIAS"),
+                    help="(Opcional) no lugar de <saida-dir>/juliet_divergencias.csv. Default via env JULIET_DIVERGENCIAS.")
     ap.add_argument("--listar-candidatos", action="store_true",
                     help="Só mostra quantos casos elegíveis existem por CWE e sai, sem compilar/rodar nada.")
     ap.add_argument("--versao", choices=("bad", "good"), default=os.environ.get("JULIET_VERSAO", "bad"),
                     help="'bad' (padrão): mede acerto do CWE. 'good': compila com -DOMITBAD (só as "
                          "funções corrigidas) e mede ALARMES FALSOS. Default via env JULIET_VERSAO.")
     args = ap.parse_args()
+    # Caminhos não dados explicitamente saem de --saida-dir (mesmo parâmetro do avaliar_codebench.py).
+    for campo, nome in (("saida", "avaliacao_juliet.csv"), ("historico", "juliet_historico.csv"),
+                        ("divergencias", "juliet_divergencias.csv")):
+        if not getattr(args, campo):
+            setattr(args, campo, os.path.join(args.saida_dir, nome))
     if args.versao == "good":
         # Saídas separadas: os campos da rodada "good" são outros (alarmes, não acertos).
         for campo in ("saida", "historico", "divergencias"):
@@ -700,20 +691,31 @@ def main():
     if args.listar_candidatos:
         return
 
+    # --por-grupo/--por-cwe: mesmo algoritmo de sempre (a seed 42 escolhe os mesmos casos das
+    # rodadas anteriores). --total: um único sorteio entre todos os candidatos dos CWEs pedidos.
     rng = random.Random(args.seed)
     selecionados = []  # (cwe_esperado, caminho, linha, nome_arquivo)
-    for cwe in cwes_pedidos:
-        disponiveis = candidatos.get(cwe, [])
-        if not disponiveis:
-            print(f"[Aviso] Nenhum candidato elegível para {cwe} — pulando.")
-            continue
-        amostra = rng.sample(disponiveis, k=min(args.por_cwe, len(disponiveis)))
-        selecionados.extend((cwe, caminho, linha, nome) for (caminho, linha, nome) in amostra)
+    if args.total:
+        todos = [(cwe, *c) for cwe in cwes_pedidos for c in candidatos.get(cwe, [])]
+        amostra = rng.sample(todos, k=min(args.total, len(todos)))
+        selecionados = [(cwe, caminho, linha, nome) for (cwe, caminho, linha, nome) in amostra]
+        amostragem = f"{args.total} no total"
+    else:
+        for cwe in cwes_pedidos:
+            disponiveis = candidatos.get(cwe, [])
+            if not disponiveis:
+                print(f"[Aviso] Nenhum candidato elegível para {cwe} — pulando.")
+                continue
+            amostra = rng.sample(disponiveis, k=min(args.por_cwe, len(disponiveis)))
+            selecionados.extend((cwe, caminho, linha, nome) for (caminho, linha, nome) in amostra)
+        amostragem = f"{args.por_cwe} por grupo (CWE)"
 
     if not selecionados:
         sys.exit("[Erro] Nenhum caso selecionado — confira --cwes e o conteúdo de --juliet-dir.")
 
-    pasta_bin = "./output/bin_juliet"
+    # Binários dentro de --saida-dir e separados por versão: duas rodadas ao mesmo tempo (ex.: bad e
+    # good) apagavam a pasta uma da outra. MEDIDO: a "bad" caiu com FileNotFoundError no rmtree.
+    pasta_bin = os.path.join(args.saida_dir, "bin_juliet" + ("_good" if args.versao == "good" else ""))
     if os.path.isdir(pasta_bin):
         shutil.rmtree(pasta_bin)
     os.makedirs(pasta_bin, exist_ok=True)
@@ -728,13 +730,18 @@ def main():
         print(f"[{i}/{len(selecionados)}] {nome_arquivo} (esperado: {cwe_esperado}, linha {linha_defeito})")
         inicio = time.time()
         try:
-            cwe_obtido, cwe_nome, ferramenta, status, linha_sintoma, linha_causa = avaliar_caso(
-                caminho, pasta_testcasesupport, pasta_bin, cwe_esperado, versao=args.versao
+            cwe_obtido, cwe_nome, ferramenta, status, linha_sintoma, linha_causa, outros = avaliar_caso(
+                caminho, pasta_testcasesupport, pasta_bin, cwe_esperado, versao=args.versao,
+                todos_erros=args.todos_erros
             )
         except Exception as e:  # caso travado/erro inesperado não aborta a rodada inteira
             cwe_obtido, cwe_nome, ferramenta, status = "-", "-", "Nenhuma", f"erro_interno: {e}"
-            linha_sintoma, linha_causa = "-", "-"
+            linha_sintoma, linha_causa, outros = "-", "-", "-"
         duracao = round(time.time() - inicio, 2)
+        # Colunas comuns aos dois datasets (experimentos.py); as próprias do Juliet vêm depois.
+        nucleo = experimentos.linha_nucleo(
+            "juliet", nome_arquivo, cwe_esperado, cwe_esperado, ferramenta, status, cwe_obtido, cwe_nome,
+            linha_sintoma, linha_causa, outros, duracao)
 
         if args.versao == "good":
             # Versão corrigida: o certo é passar limpo; qualquer detecção é alarme falso.
@@ -746,15 +753,9 @@ def main():
             print(f"      -> {ferramenta} | status={status} | obtido={cwe_obtido} | "
                   f"{natureza if alarme else 'ok (limpo)'} ({duracao}s)")
             linhas_csv.append({
-                "Arquivo": nome_arquivo,
-                "CWE do Caso (Juliet)": cwe_esperado,
-                "CWE Obtido (pipeline)": cwe_obtido,
-                "Linha Sintoma (ferramenta)": linha_sintoma,
-                "Ferramenta": ferramenta,
-                "Status": status,
+                **nucleo,
                 "Detectou Algo": "sim" if alarme else "não",
                 "Natureza da Detecção": natureza,
-                "Tempo (s)": duracao,
             })
             continue
 
@@ -782,19 +783,11 @@ def main():
               f"| causa={causa} ({duracao}s)")
 
         linhas_csv.append({
-            "Arquivo": nome_arquivo,
-            "CWE Esperado (Juliet)": cwe_esperado,
+            **nucleo,
             "Linha do Defeito (manifest)": linha_defeito,
-            "Linha Sintoma (ferramenta)": linha_sintoma,
-            "Linha Causa (ferramenta)": linha_causa,
-            "CWE Obtido (pipeline)": cwe_obtido,
-            "Nome CWE Obtido": cwe_nome,
-            "Ferramenta": ferramenta,
-            "Status": status,
             "Acerto Estrito": "sim" if acerto_estrito else "não",
             "Acerto com Hierarquia/Convenção": "sim" if acerto_hierarquia else "não",
             "Causa": causa,
-            "Tempo (s)": duracao,
         })
 
     with open(args.saida, "w", newline="", encoding="utf-8") as f:
@@ -804,7 +797,9 @@ def main():
     print(f"\n[Info] CSV da rodada salvo em: {args.saida}")
 
     os.makedirs(os.path.dirname(args.historico) or ".", exist_ok=True)
-    _registrar_historico(args.historico, args, cwes_pedidos, linhas_csv)
+    _registrar_historico(args.historico, args, cwes_pedidos, linhas_csv,
+                         experimentos.versao_dataset(args.juliet_dir, os.path.join(args.juliet_dir, "manifest.xml")),
+                         amostragem)
     print(f"[Info] Histórico acumulado em: {args.historico}")
 
     if args.versao == "good":
@@ -818,7 +813,7 @@ def main():
         print(f"Vazamentos reais no código corrigido (alocação sem free): {len(vazamentos)}")
         print(f"Alarmes falsos:   {len(alarmes)}/{total} ({100*len(alarmes)/total:.1f}%)")
         for l in alarmes:
-            print(f"  {l['Arquivo']} -> {l['CWE Obtido (pipeline)']} ({l['Ferramenta']})")
+            print(f"  {l['Item']} -> {l['CWE Obtido']} ({l['Ferramenta']})")
         return
 
     os.makedirs(os.path.dirname(args.divergencias) or ".", exist_ok=True)
@@ -826,7 +821,7 @@ def main():
     print(f"[Info] Divergências acumuladas em: {args.divergencias}")
 
     # ── RESUMO ──
-    compilacao_falhou = sum(1 for l in linhas_csv if l["Status"] == "erro_compilacao")
+    compilacao_falhou = sum(1 for l in linhas_csv if l["Status Pipeline"] == "erro_compilacao")
     lentes = resumo_por_lentes(linhas_csv)
     nomes_lentes = {
         "L1": "estrito (CWE igual ao rótulo)",
@@ -854,7 +849,7 @@ def main():
 
     print("\nPor CWE (estrito):")
     for cwe in cwes_pedidos:
-        linhas_cwe = [l for l in linhas_csv if l["CWE Esperado (Juliet)"] == cwe]
+        linhas_cwe = [l for l in linhas_csv if l["Rótulo Esperado"] == cwe]
         if not linhas_cwe:
             continue
         acertos = sum(1 for l in linhas_cwe if l["Acerto Estrito"] == "sim")

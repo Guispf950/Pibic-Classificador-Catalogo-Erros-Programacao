@@ -26,6 +26,11 @@ from src.malha1_asan import executar_malha_1_asan          # ASan + GDB (erros e
 from src.malha2_valgrind import executar_malha_2_valgrind  # Valgrind (não-inic., leaks)
 from src.malha_ubsan import executar_malha_ubsan, deve_refinar  # UBSan (estouro de int, índice)
 from src.parser_logs import limpar_log_gdb                 # filtra o log antes do LLM
+from src.varredura_valgrind import coletar_blocos, extrair_blocos  # varredura completa (opcional)
+
+# TODOS_ERROS=1 (repassada pelo sandbox.py): além do erro principal, devolve os blocos de TODOS os
+# erros que o Valgrind vê numa execução sem congelar. A classificação deles é feita no host.
+TODOS_ERROS = os.environ.get("TODOS_ERROS", "0") == "1"
 
 # Marcador que separa o RUÍDO (prints das malhas) do JSON de resultado. O sandbox.py
 # procura por esta linha e lê o JSON logo depois — assim os prints não atrapalham.
@@ -64,7 +69,8 @@ def analisar_arquivo(caminho_codigo: str, entrada=None) -> dict:
                 resultado, ferramenta = refinado, "UBSan (refinando crash da Malha 1)"
     else:
         # ── MALHA 2: Valgrind + vgdb (só se a Malha 1 passou limpa) ───────────
-        resultado = executar_malha_2_valgrind(caminho_codigo, entrada=entrada)
+        resultado = executar_malha_2_valgrind(caminho_codigo, entrada=entrada,
+                                              continuar_apos_erro=TODOS_ERROS)
         if resultado:
             ferramenta = "Valgrind+vgdb"
         else:
@@ -77,13 +83,21 @@ def analisar_arquivo(caminho_codigo: str, entrada=None) -> dict:
     if resultado and resultado.get("log"):
         log_bruto = resultado["log"]
         log_limpo = limpar_log_gdb(log_bruto, nome_arquivo)
-        return {
+        saida = {
             "erro_encontrado": True,
             "ferramenta": ferramenta,
             "categoria": categoria,
             "log_bruto": log_bruto,
             "log_limpo": log_limpo,
         }
+        if TODOS_ERROS and categoria != "compilacao":
+            # Se o erro principal veio da Malha 2, ela já deixou o programa ir até o fim: reaproveita
+            # o relatório dela em vez de rodar o Valgrind de novo.
+            if resultado.get("log_completo") is not None:
+                saida["blocos_varredura"] = extrair_blocos(resultado["log_completo"])
+            else:
+                saida["blocos_varredura"] = coletar_blocos(caminho_codigo, "/tmp/bin_varredura", entrada=entrada)
+        return saida
 
     # Nenhuma falha: código passou limpo nas malhas de memória.
     return {

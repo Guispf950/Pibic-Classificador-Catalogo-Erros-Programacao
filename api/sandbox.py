@@ -26,7 +26,9 @@ import tempfile
 # "docker" = usa contêiner de verdade; qualquer outro valor = modo mock (sem executar).
 MODO_SANDBOX = os.environ.get("MODO_SANDBOX", "mock")
 IMAGEM = os.environ.get("IMAGEM_ANALISE", "analise-mem:latest")   # nome da imagem Docker
-TIMEOUT_S = int(os.environ.get("SANDBOX_TIMEOUT_S", "180"))        # teto (heurística de 3 min assim como no codebench)
+TIMEOUT_S = int(os.environ.get("SANDBOX_TIMEOUT_S", "180"))
+# "1" = o contêiner também roda a varredura completa (lista todos os erros, não só o 1º).
+TODOS_ERROS = os.environ.get("TODOS_ERROS", "0")        # teto (heurística de 3 min assim como no codebench)
 
 # Marcador que o runner_analise.py imprime antes do JSON de resultado (ver aquele arquivo).
 MARCADOR = "===RESULTADO_JSON==="
@@ -107,6 +109,7 @@ def rodar_em_sandbox(codigo: str, entrada: str, nome_arquivo: str = "submissao.c
             "--security-opt", "seccomp=unconfined",  # ASan/Valgrind usam syscalls que o
                                                      # perfil seccomp padrão barra
             "-v", f"{tmp}:/work:ro",       # monta o código do aluno em /work (só-leitura)
+            "-e", f"TODOS_ERROS={TODOS_ERROS}",  # liga/desliga a varredura completa no runner
             IMAGEM,                        # a imagem a usar (ver Dockerfile.analise)
             "/work/" + nome_arquivo,       # argumento: qual arquivo analisar
         ]

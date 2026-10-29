@@ -17,6 +17,7 @@ ARQUITETURA DO MODO REAL (escolhas confirmadas com o pesquisador):
 Como alternar (variáveis de ambiente):
   USAR_PIPELINE_REAL=1   -> liga o pipeline real (senão, MOCK).
   MODO_SANDBOX=docker    -> detecção no contêiner (senão, sandbox devolve mock).
+  TODOS_ERROS=1          -> além do erro principal, devolve "outros_erros" (varredura completa).
   Rode a API a partir da RAIZ do projeto (ver README) para o `import src...` e a base
   de conhecimento (./base_conhecimento) resolverem.
 """
@@ -87,6 +88,13 @@ def analisar(codigo: str, entrada: str, nome_arquivo: str) -> dict:
         analise["tipo_erro"] = "compilation-error"
     # Anexa a ferramenta que detectou (útil para o front e para depurar).
     analise["ferramenta"] = deteccao.get("ferramenta", "-")
+    # 4) Varredura completa (TODOS_ERROS=1): classifica no host os blocos que o contêiner coletou.
+    #    Cada item traz "apos_escrita_invalida": se True, pode ser consequência de um erro anterior.
+    if "blocos_varredura" in deteccao:
+        from src.varredura_valgrind import classificar_blocos
+        analise["outros_erros"] = classificar_blocos(
+            deteccao["blocos_varredura"], codigo, nome_arquivo,
+            principal=(analise["cwe_id"], analise["linha_sintoma"]))
     return analise
 
 

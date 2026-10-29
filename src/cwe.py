@@ -16,8 +16,12 @@ A classificação tem duas camadas, avaliadas numa ÚNICA sequência de priorida
        de variável da pilha mais próxima do acesso; do texto "underflows/overflows this
        variable"; do byte marcado no mapa de memória-sombra (alloca/VLA); do nome do erro;
      - segmentation fault: o ENDEREÇO da falha (impresso pelo GDB a partir de $_siginfo, ver
-       malha1_asan.py) separa ponteiro nulo, recursão sem fim, escrita em memória só-leitura
-       e ponteiro com lixo -> CWE-476/674/758/824;
+       malha1_asan.py) separa ponteiro nulo, recursão sem fim, escrita em memória só-leitura,
+       índice impossível (com prova aritmética, ver seção 3) e ponteiro com lixo
+       -> CWE-476/674/758/191/129/824;
+     - uso de memória já liberada: pelas pilhas completas de alocação e liberação do bloco,
+       separa uso após free (416) de ponteiro com lixo que caiu num bloco que o programa nunca
+       recebeu (824), ver seção 1b;
      - cópia com origem e destino sobrepostos: se o tamanho copiado passa do espaço do
        destino, o erro real é estouro (121/122/787) e a sobreposição é só efeito colateral;
      - relatório do UBSan (malha_ubsan.py): índice fora do vetor, estouro de inteiro com sinal,
@@ -136,7 +140,73 @@ _RX_DIVISAO_ZERO   = re.compile(
 
 def _regra(rx, cwe_id):
     """Passo simples: devolve cwe_id se o padrão aparece no log, senão None."""
-    return lambda log: cwe_id if rx.search(log) else None
+    return lambda log, codigo="": cwe_id if rx.search(log) else None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1b. REFINAMENTO: uso após free × ponteiro com lixo que caiu num bloco liberado
+# ══════════════════════════════════════════════════════════════════════════════
+# O ASan diz "heap-use-after-free" sempre que o endereço lido está num bloco já liberado — mas
+# não sabe COMO o ponteiro chegou lá. MEDIDO no CodeBench (RE03, "Imprime Fila ao Contrário"):
+# `iniciaFila` zera só a cópia local, `fila.prim` fica com lixo e a lista termina num endereço
+# que, por acaso, é de um bloco que a INICIALIZAÇÃO DO ASAN alocou e liberou antes do main. Não
+# há nenhum free no código do aluno: o erro real é ponteiro não inicializado (CWE-824).
+# Regra: com as pilhas COMPLETAS de liberação e de alocação do bloco (o ASan as obtém numa 2ª
+# execução, ver malha1_asan._pilhas_completas_do_bloco; o Valgrind já as dá completas), se
+# NENHUM quadro delas é do programa, o programa nunca recebeu esse bloco -> CWE-824.
+#   "Quadro do programa" = `main` ou função cujo nome aparece no código seguido de "(" — definida
+#   ou chamada por ele (ex.: getline, fclose). Os alocadores (malloc, free...) não contam: o
+#   próprio carregador do sistema tem um `malloc` na pilha (RE03) e o aluno também os chama.
+# Sem pilhas completas, sem o código, ou com um quadro "<unknown module>" (pilha cortada), não há
+# prova: fica CWE-416. MEDIDO por que isso importa: no modo rápido, um uso após free VERDADEIRO
+# (getline realocando o bloco) tinha as duas pilhas sem nenhum quadro do aluno.
+MARCA_PILHAS_COMPLETAS = "===== PILHAS COMPLETAS DO BLOCO"   # ver malha1_asan.py
+_RX_QUADRO = re.compile(r"^\s*(?:==\d+==\s+)?(?:#\d+ 0x[0-9a-fA-F]+(?: in (\S+))?|(?:at|by) 0x[0-9A-Fa-f]+: (\S+))")
+_FUNCOES_ALOCADOR = {"malloc", "calloc", "realloc", "reallocarray", "free", "operator"}
+# Cabeçalhos das duas pilhas, na ordem em que aparecem (liberação, depois alocação).
+_CABECALHOS_ASAN = (re.compile(r"^freed by thread"), re.compile(r"^previously allocated by thread"))
+_CABECALHOS_VALGRIND = (re.compile(r"block of size \d+ free'd"), re.compile(r"Block was alloc'd at"))
+
+
+def _pilhas_do_bloco(log):
+    """[pilha de liberação, pilha de alocação] (linhas de quadro) do bloco; None se não houver as duas."""
+    marca = log.find(MARCA_PILHAS_COMPLETAS)
+    if marca >= 0:                                 # ASan (modo completo)
+        texto, cabecalhos = log[marca:], _CABECALHOS_ASAN
+    elif "Block was alloc'd at" in log:            # Valgrind
+        texto, cabecalhos = log, _CABECALHOS_VALGRIND
+    else:
+        return None
+    pilhas, atual = [], None
+    for linha in texto.splitlines():
+        if len(pilhas) < 2 and cabecalhos[len(pilhas)].search(linha):
+            atual = []
+            pilhas.append(atual)
+        elif atual is not None and _RX_QUADRO.match(linha):
+            atual.append(linha)
+        else:
+            atual = None
+    return pilhas if len(pilhas) == 2 and all(pilhas) else None
+
+
+def _quadro_do_programa(linha, codigo):
+    m = _RX_QUADRO.match(linha)
+    nome = (m.group(1) or m.group(2) or "").split("@")[0]   # Valgrind: "fclose@@GLIBC_2.2.5"
+    if not nome or nome in _FUNCOES_ALOCADOR or nome.startswith(("__interceptor_", "___interceptor_")):
+        return False
+    return nome == "main" or re.search(rf"\b{re.escape(nome)}\s*\(", codigo) is not None
+
+
+def _classificar_uso_apos_free(log, codigo=""):
+    if not _RX_USE_AFTER_FREE.search(log):
+        return None
+    pilhas = _pilhas_do_bloco(log)
+    if pilhas and codigo:
+        quadros = pilhas[0] + pilhas[1]
+        if (not any("<unknown module>" in q for q in quadros)
+                and not any(_quadro_do_programa(q, codigo) for q in quadros)):
+            return "CWE-824"
+    return "CWE-416"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -208,7 +278,7 @@ def _lado_pela_pilha(log):
     return melhor[1] if melhor else None
 
 
-def _classificar_estouro_asan(log):
+def _classificar_estouro_asan(log, codigo=""):
     m = _RX_ESTOURO_ASAN.search(log)
     if not m:
         return None
@@ -243,7 +313,7 @@ def _classificar_estouro_asan(log):
     return _cwe_por_limites(regiao, acesso, lado)
 
 
-def _classificar_invalido_valgrind(log):
+def _classificar_invalido_valgrind(log, codigo=""):
     m = _RX_INVALIDO_VALGRIND.search(log)
     if not m:
         return None
@@ -255,7 +325,11 @@ def _classificar_invalido_valgrind(log):
         return _cwe_por_limites("heap", acesso, lado)
     solto = _RX_ENDERECO_SOLTO.search(resto)
     if solto:
-        return "CWE-476" if int(solto.group(1), 16) < LIMITE_PAGINA_ZERO else "CWE-824"
+        endereco = int(solto.group(1), 16)
+        if endereco < LIMITE_PAGINA_ZERO:
+            return "CWE-476"
+        # Com a "foto" do GDB (Malha 2), separa índice impossível de ponteiro com lixo (ver seção 3).
+        return _classificar_indice_impossivel(log, endereco) or "CWE-824"
     # Sem detalhe de posição: classificação genérica pela direção do acesso.
     return "CWE-787" if acesso == "WRITE" else "CWE-125"
 
@@ -279,7 +353,80 @@ def _endereco(texto):
     return 0 if texto == "(nil)" else int(texto, 16)
 
 
-def _classificar_segfault(log):
+# ── Índice impossível × ponteiro com lixo ─────────────────────────────────────
+# Um endereço não nulo e não mapeado tanto pode vir de um PONTEIRO com lixo (CWE-824) quanto de um
+# ponteiro bom com um ÍNDICE absurdo. MEDIDO no CodeBench (RE04, quicksort): `unsigned i, j;` e,
+# com j == 0, `j--` dá a volta para 4294967295; `vetor[j]` (L23) cai a ~275 GB do vetor e o
+# pipeline dizia 824, mas o ponteiro `vetor` estava certo.
+# A regra NÃO julga o índice só pelo tamanho; ela exige uma PROVA ARITMÉTICA de que o endereço da
+# falha é exatamente o de `p[k]`. Com o `bt full` do GDB (variáveis do quadro #0) e a linha do
+# código onde o programa parou:
+#   1. a linha tem um acesso `p[k]` (ou `p[k ± constante]`) em que `p` é um ponteiro e `k` um
+#      inteiro do quadro #0 (o GDB imprime ponteiro em hexadecimal e inteiro em decimal);
+#   2. o valor de k é impossível como índice: k >= 2^31 (não cabe num `int`, e nenhum vetor do
+#      aluno tem 2 bilhões de posições — o contêiner tem 4 GB);
+#   3. existe um tamanho de elemento T (1 a 65536 bytes) tal que endereço da falha = p + k*T + d,
+#      com d um deslocamento DENTRO do elemento (ex.: o campo .id do struct). Com k na casa dos
+#      bilhões, a chance de um endereço qualquer passar nesse teste por acaso é desprezível
+#      (cabe numa janela de T+16 bytes a cada k*T).
+# Sob o ASan o SIGSEGV pode acontecer ao ler a MEMÓRIA-SOMBRA do endereço, não o endereço em si:
+# a sombra fica em (endereço >> 3) + 0x7fff8000 (x86-64). Por isso testa-se também o endereço
+# "des-sombreado". MEDIDO no RE04: falha em 0x10087fff7cab = sombra de vetor + j*64 + 60 (.id).
+# CWE: se k é um número negativo pequeno que deu a volta num unsigned (2^32 - k ou 2^64 - k até
+# 2^20), a causa é o UNDERFLOW (CWE-191, a revisão manual do RE04 diz isso); senão, índice não
+# validado (CWE-129). Fora desses casos a regra não diz nada e vale a anterior (824).
+# Não cobre (fica 824): índice negativo num int com sinal, vetor local (o GDB mostra o conteúdo,
+# não o endereço) e índice que é uma expressão (ex.: v[i*n+j]).
+_DESLOCAMENTO_SOMBRA_ASAN = 0x7fff8000
+_INDICE_IMPOSSIVEL = 2 ** 31
+_MAIOR_ELEMENTO = 65536
+_FOLGA_VOLTA = 2 ** 20
+_RX_QUADRO0_GDB = re.compile(r"^#0\s+(?:0x[0-9a-fA-F]+ in )?\S+ \((.*)\) at \S+:(\d+)\s*$", re.M)
+_RX_ARG_GDB = re.compile(r"(?:^|, )(\w+)=(-?\d+|0x[0-9a-fA-F]+)(?=,|\s|$)")
+_RX_LOCAL_GDB = re.compile(r"^\s+(\w+) = (-?\d+|0x[0-9a-fA-F]+)(?:\s|$)")
+_RX_LINHA_GDB = re.compile(r"^(\d+)\t(.*)$", re.M)
+_RX_INDEXACAO = re.compile(r"\b(\w+)\s*\[\s*(\w+)\s*(?:([+-])\s*(\d+)\s*)?\]")
+
+
+def _deu_a_volta(k):
+    return any(0 < 2 ** bits - k <= _FOLGA_VOLTA for bits in (32, 64))
+
+
+def _classificar_indice_impossivel(log, endereco):
+    """CWE-191/129 se o endereço da falha é, comprovadamente, p[k] com k impossível; senão None."""
+    quadro = _RX_QUADRO0_GDB.search(log)
+    if not quadro:
+        return None
+    variaveis = dict(_RX_ARG_GDB.findall(quadro.group(1)))
+    for linha in log[quadro.end():].splitlines()[1:]:
+        local = _RX_LOCAL_GDB.match(linha)
+        if not linha.startswith((" ", "\t")):
+            break                                   # fim das variáveis do quadro #0
+        if local:
+            variaveis.setdefault(local.group(1), local.group(2))
+    fonte = next((m.group(2) for m in _RX_LINHA_GDB.finditer(log) if m.group(1) == quadro.group(2)), None)
+    if not fonte:
+        return None
+    candidatos = [endereco]
+    if endereco > _DESLOCAMENTO_SOMBRA_ASAN:
+        candidatos.append((endereco - _DESLOCAMENTO_SOMBRA_ASAN) << 3)
+    for base, indice, sinal, constante in _RX_INDEXACAO.findall(fonte):
+        p, k = variaveis.get(base, ""), variaveis.get(indice, "")
+        if not p.startswith("0x") or not re.fullmatch(r"-?\d+", k):
+            continue
+        p = int(p, 16)
+        k = int(k) + (int(constante) if sinal == "+" else -int(constante) if sinal == "-" else 0)
+        if p < LIMITE_PAGINA_ZERO or k < _INDICE_IMPOSSIVEL:
+            continue
+        for alvo in candidatos:
+            tamanho = round((alvo - p) / k)
+            dentro = alvo - p - k * tamanho          # deslocamento dentro do elemento
+            if 1 <= tamanho <= _MAIOR_ELEMENTO and -8 <= dentro < tamanho + 8:
+                return "CWE-191" if _deu_a_volta(k) else "CWE-129"
+    return None
+
+
+def _classificar_segfault(log, codigo=""):
     if not _RX_SEGFAULT.search(log):
         return None
 
@@ -294,13 +441,16 @@ def _classificar_segfault(log):
             return "CWE-476"        # ponteiro NULL (puro ou + deslocamento pequeno)
         if codigo == SEGV_ACCERR:
             return "CWE-758"        # escrita em memória só-leitura (ex.: string literal)
-        return "CWE-824"            # endereço não nulo e não mapeado: ponteiro com lixo
+        # endereço não nulo e não mapeado: índice impossível (com prova) ou ponteiro com lixo
+        return _classificar_indice_impossivel(log, endereco) or "CWE-824"
 
     faixa = _RX_FAIXA_VALGRIND.search(log)
     if faixa:
         if _endereco(faixa.group(2)) < LIMITE_PAGINA_ZERO:
             return "CWE-476"
-        return "CWE-758" if faixa.group(1).startswith("Bad permissions") else "CWE-824"
+        if faixa.group(1).startswith("Bad permissions"):
+            return "CWE-758"
+        return _classificar_indice_impossivel(log, _endereco(faixa.group(2))) or "CWE-824"
 
     asan = _RX_SEGV_ASAN.search(log)
     if asan:
@@ -353,7 +503,7 @@ def _espaco_do_destino(log, inicio):
     return None
 
 
-def _classificar_sobreposicao(log):
+def _classificar_sobreposicao(log, codigo=""):
     if not _RX_SOBREPOSICAO.search(log):
         return None
     m = _RX_INTERVALOS_SOBREPOSTOS.search(log)      # Valgrind não dá os intervalos: fica 475
@@ -383,7 +533,7 @@ _RX_UB_DIV_ZERO = re.compile(r"division by zero")
 _RX_UB_NULO = re.compile(r"null pointer")
 
 
-def _classificar_ubsan(log):
+def _classificar_ubsan(log, codigo=""):
     m = _RX_UBSAN.search(log)
     if not m:
         return None
@@ -421,7 +571,7 @@ _PASSOS = [
     _regra(_RX_MISMATCHED, "CWE-762"),
     _regra(_RX_INVALID_FREE, "CWE-415"),
     # Uso de memória já liberada / variável local fora do tempo de vida
-    _regra(_RX_USE_AFTER_FREE, "CWE-416"),
+    _classificar_uso_apos_free,       # 416, ou 824 se o bloco nunca foi do programa
     _regra(_RX_AFTER_RETURN, "CWE-562"),
     _regra(_RX_AFTER_SCOPE, "CWE-825"),
     # Acesso fora dos limites (ASan): leitura/escrita x antes/depois
@@ -445,15 +595,16 @@ _PASSOS = [
 ]
 
 
-def classificar_cwe(log):
+def classificar_cwe(log, codigo_fonte=""):
     """
     Devolve (cwe_id, cwe_nome) a partir do relatório da ferramenta, ou ('-', '-').
     Percorre os passos em ordem e retorna o CWE do primeiro que reconhece o log.
+    `codigo_fonte` (opcional) só é usado para saber quais funções são do programa (seção 1b).
     """
     if not log:
         return SEM_CWE
     for passo in _PASSOS:
-        cwe_id = passo(log)
+        cwe_id = passo(log, codigo_fonte)
         if cwe_id:
             return (cwe_id, _NOME[cwe_id])
     return SEM_CWE
@@ -492,10 +643,10 @@ _TIPO_POR_CWE = {
 }
 
 
-def classificar_cwe_tipo(log):
+def classificar_cwe_tipo(log, codigo_fonte=""):
     """
     Como classificar_cwe, mas devolve também o nome técnico (tipo_erro), tudo determinístico.
     Retorna (cwe_id, cwe_nome, tipo_erro); sem assinatura conhecida, ("-", "-", "-").
     """
-    cwe_id, cwe_nome = classificar_cwe(log)
+    cwe_id, cwe_nome = classificar_cwe(log, codigo_fonte)
     return cwe_id, cwe_nome, _TIPO_POR_CWE.get(cwe_id, "-")
